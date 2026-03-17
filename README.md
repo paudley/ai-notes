@@ -15,8 +15,8 @@ AMD Strix Halo APUs (Zen 5 + RDNA 3.5, gfx1151). Compiles every component
 -- from the ROCm SDK to Python itself -- with aggressive optimization flags
 targeting the Strix Halo unified memory architecture.
 
-- **32-step build pipeline** across 8 phases (TheRock ROCm → AOCL → Python → PyTorch + TorchVision → Triton → vLLM → Flash Attention → optimized wheels)
-- **29 documented build fixes** with root cause analysis ([BUILD-FIXES.md](strix-halo/BUILD-FIXES.md))
+- **35-step build pipeline** across 9 phases (TheRock ROCm → AOCL → Python → PyTorch + TorchVision → Triton → vLLM → Flash Attention → optimized wheels → Lemonade)
+- **55+ documented build fixes** with root cause analysis ([BUILD-FIXES.md](strix-halo/BUILD-FIXES.md))
 - **Environment activation script** with compiler flags for Zen 5 CPU + RDNA 3.5 GPU
 - Native AVX-512, Polly loop optimizer, AMD-specific `-famd-opt` tuning
 

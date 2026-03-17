@@ -91,6 +91,49 @@ source "${_SCRIPT_DIR}/common.sh"
 unset _SCRIPT_REAL_PATH
 
 # =============================================================================
+# Distro Detection
+# =============================================================================
+# Reads /etc/os-release and maps to a distro family (arch, ubuntu, fedora).
+# Used for package install hints and bootstrap tool selection.
+
+DISTRO_ID="unknown"
+DISTRO_FAMILY="unknown"
+
+detect_distro() {
+    local os_id="" os_id_like=""
+    if [[ -f /etc/os-release ]]; then
+        os_id="$(. /etc/os-release && echo "${ID:-}")"
+        os_id_like="$(. /etc/os-release && echo "${ID_LIKE:-}")"
+    fi
+
+    DISTRO_ID="${os_id}"
+
+    # Map to distro family — check ID first, then ID_LIKE for derivatives.
+    # Arch derivatives: CachyOS, EndeavourOS, Manjaro, Garuda
+    # Ubuntu derivatives: Linux Mint, Pop!_OS, elementary
+    # Fedora derivatives: Nobara, Ultramarine, Bazzite
+    case "${os_id}" in
+        arch|cachyos|endeavouros|manjaro|garuda) DISTRO_FAMILY="arch" ;;
+        ubuntu|linuxmint|pop|elementary|zorin)   DISTRO_FAMILY="ubuntu" ;;
+        debian)                                   DISTRO_FAMILY="ubuntu" ;;
+        fedora|nobara|ultramarine|bazzite)       DISTRO_FAMILY="fedora" ;;
+        rhel|centos|rocky|alma)                  DISTRO_FAMILY="fedora" ;;
+        *)
+            # Fall back to ID_LIKE for unrecognized derivatives
+            case "${os_id_like}" in
+                *arch*)   DISTRO_FAMILY="arch" ;;
+                *ubuntu*) DISTRO_FAMILY="ubuntu" ;;
+                *debian*) DISTRO_FAMILY="ubuntu" ;;
+                *fedora*) DISTRO_FAMILY="fedora" ;;
+                *rhel*)   DISTRO_FAMILY="fedora" ;;
+            esac
+            ;;
+    esac
+}
+
+detect_distro
+
+# =============================================================================
 # YAML Manifest Helpers
 # =============================================================================
 # The package manifest (vllm-packages.yaml) is the single source of truth for
@@ -218,12 +261,161 @@ newest_wheel() {
     echo "${newest}"
 }
 
+# Remove older versions of a wheel, keeping only the newest.
+# Usage: prune_old_wheels "torch-*.whl"
+# The glob pattern should match all versions of one package.
+prune_old_wheels() {
+    local pattern="$1"
+    local newest
+    newest="$(newest_wheel "${pattern}")"
+    [[ -z "${newest}" ]] && return 0
+    for f in ${pattern}; do
+        [[ -f "${f}" ]] || continue
+        if [[ "${f}" != "${newest}" ]]; then
+            info "Removing old wheel: $(basename "${f}")"
+            rm -f "${f}"
+        fi
+    done
+}
+
+# =============================================================================
+# Bootstrap Tools (uv, yq)
+# =============================================================================
+# uv and yq may not be in system repos on Ubuntu/Fedora. We download
+# standalone binaries to LOCAL_PREFIX/bin/ if they're not already on PATH.
+# They're also installed into the venv later for self-contained builds.
+
+_bootstrap_arch() {
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64)  echo "x86_64" ;;
+        aarch64) echo "aarch64" ;;
+        *)       die "Unsupported architecture: ${arch}" ;;
+    esac
+}
+
+_bootstrap_goarch() {
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        *)       die "Unsupported architecture: ${arch}" ;;
+    esac
+}
+
+bootstrap_uv() {
+    if command -v uv &>/dev/null; then
+        return 0
+    fi
+
+    local version arch url dest
+    version="$(ycfg '.prerequisites.bootstrap.uv.version')"
+    arch="$(_bootstrap_arch)"
+    url="$(ycfg '.prerequisites.bootstrap.uv.url_template')"
+    url="${url//\{version\}/${version}}"
+    url="${url//\{arch\}/${arch}}"
+    dest="${LOCAL_PREFIX}/bin"
+
+    info "Bootstrapping uv ${version} to ${dest}..."
+    mkdir -p "${dest}"
+    curl -fsSL "${url}" | tar -xz -C "${dest}" --strip-components=1 --wildcards '*/uv'
+    chmod +x "${dest}/uv"
+    export PATH="${dest}:${PATH}"
+    success "uv ${version} installed to ${dest}/uv"
+}
+
+bootstrap_yq() {
+    if command -v yq &>/dev/null; then
+        return 0
+    fi
+
+    local dest="${LOCAL_PREFIX}/bin"
+    mkdir -p "${dest}"
+
+    # Strategy 1: If Go is installed, use go install (always gets latest)
+    if command -v go &>/dev/null; then
+        info "Installing yq via 'go install' (latest)..."
+        GOBIN="${dest}" go install github.com/mikefarah/yq/v4@latest
+        if [[ -x "${dest}/yq" ]]; then
+            export PATH="${dest}:${PATH}"
+            success "yq installed via go install to ${dest}/yq"
+            return 0
+        fi
+        warn "go install yq failed, falling back to binary download"
+    fi
+
+    # Strategy 2: Download latest release binary from GitHub
+    local version goarch url
+    info "Fetching latest yq release tag from GitHub..."
+    version="$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest \
+        | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')"
+    if [[ -z "${version}" ]]; then
+        die "Failed to determine latest yq version from GitHub API"
+    fi
+    goarch="$(_bootstrap_goarch)"
+    url="https://github.com/mikefarah/yq/releases/download/v${version}/yq_linux_${goarch}"
+
+    info "Bootstrapping yq ${version} to ${dest}..."
+    curl -fsSL -o "${dest}/yq" "${url}"
+    chmod +x "${dest}/yq"
+    export PATH="${dest}:${PATH}"
+    success "yq ${version} installed to ${dest}/yq"
+}
+
+# Bootstrap uv and yq if not on PATH. Called before check_prerequisites()
+# because yq is needed to read the YAML manifest for further checks.
+# Note: yq must be bootstrapped BEFORE ycfg() is usable, so we read the
+# YAML bootstrap config only for uv (yq bootstraps via go install or
+# GitHub API latest release — no hardcoded version).
+bootstrap_tools() {
+    # Ensure LOCAL_PREFIX/bin is on PATH so bootstrapped tools are findable
+    mkdir -p "${LOCAL_PREFIX}/bin"
+    export PATH="${LOCAL_PREFIX}/bin:${PATH}"
+
+    # yq first — needed to parse YAML for everything else.
+    # bootstrap_yq() tries go install (latest), then GitHub API latest release.
+    bootstrap_yq
+
+    # uv — can use ycfg() now that yq is available
+    bootstrap_uv
+}
+
+# Install uv and yq into the venv's bin/ for self-contained builds.
+# Called during create_venv() after the venv is created and activated.
+install_tools_to_venv() {
+    local venv_bin="${VLLM_VENV}/bin"
+
+    # uv: pip-installable (provides the uv binary in the venv)
+    if [[ ! -x "${venv_bin}/uv" ]]; then
+        info "Installing uv into venv..."
+        pip install uv -q
+    fi
+
+    # yq: standalone Go binary — copy from bootstrap location or system
+    if [[ ! -x "${venv_bin}/yq" ]]; then
+        local yq_src
+        yq_src="$(command -v yq 2>/dev/null || true)"
+        if [[ -n "${yq_src}" ]]; then
+            info "Installing yq into venv (copy from ${yq_src})..."
+            cp "${yq_src}" "${venv_bin}/yq"
+            chmod +x "${venv_bin}/yq"
+        fi
+    fi
+}
+
 # =============================================================================
 # Prerequisites Check
 # =============================================================================
 
 check_prerequisites() {
     section "Checking prerequisites"
+
+    info "Detected distro: ${DISTRO_ID} (family: ${DISTRO_FAMILY})"
+
+    # Bootstrap uv and yq if not on PATH
+    bootstrap_tools
 
     # Read required commands from manifest
     local required_cmds
@@ -240,7 +432,12 @@ check_prerequisites() {
         fi
     done
     if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
-        die "Missing system packages: ${missing_pkgs[*]}. Install with:\n  $(ycfg '.prerequisites.install_command')"
+        local install_hint
+        install_hint="$(ycfg ".prerequisites.install_commands.${DISTRO_FAMILY}.packages" 2>/dev/null || true)"
+        if [[ -z "${install_hint}" ]]; then
+            install_hint="Install manually: ${missing_pkgs[*]} (no install command for distro '${DISTRO_FAMILY}')"
+        fi
+        die "Missing system packages: ${missing_pkgs[*]}. Install with:\n  ${install_hint}"
     fi
     success "System build tools present"
 
@@ -280,7 +477,11 @@ check_prerequisites() {
     kernel_major="${kernel_ver%%.*}"
     if [[ "${kernel_major}" -lt "${kernel_min%%.*}" ]]; then
         warn "Kernel ${kernel_ver} detected. Kernel ${kernel_min}+ recommended."
-        warn "Install with: sudo pacman -S $(ycfg '.prerequisites.kernel_package')"
+        local kernel_pkg
+        kernel_pkg="$(ycfg ".prerequisites.install_commands.${DISTRO_FAMILY}.kernel" 2>/dev/null || true)"
+        if [[ -n "${kernel_pkg}" ]]; then
+            warn "Kernel package: ${kernel_pkg}"
+        fi
     else
         success "Kernel ${kernel_ver}"
     fi
@@ -978,6 +1179,9 @@ create_venv() {
                 install_pkg_deps venv
             fi
 
+            # Ensure uv and yq are in the venv
+            install_tools_to_venv
+
             success "Venv activated"
             return
         fi
@@ -996,6 +1200,9 @@ create_venv() {
 
     # Install essential build tools from YAML manifest
     install_pkg_deps venv
+
+    # Install uv and yq into venv for self-contained builds
+    install_tools_to_venv
 
     success "Venv created and activated (Python $(python --version 2>&1 | awk '{print $2}'))"
 }
@@ -1262,6 +1469,7 @@ HIPEOF
         --no-deps \
         --wheel-dir "${WHEELS_DIR}" \
         -v
+    prune_old_wheels "${WHEELS_DIR}"/torch-*.whl
 
     # Step 2: Patch .so files INSIDE the wheel. pip wheel re-invokes cmake
     # during packaging, so patching the source tree beforehand doesn't work —
@@ -1393,6 +1601,7 @@ build_torchvision() {
         --no-deps \
         --wheel-dir "${WHEELS_DIR}" \
         -v
+    prune_old_wheels "${WHEELS_DIR}"/torchvision-*.whl
 
     # Install the wheel into the build venv
     info "Installing TorchVision wheel into build venv..."
@@ -1471,6 +1680,7 @@ build_triton() {
     cd "${triton_pkg_dir}"
     mkdir -p "${WHEELS_DIR}"
     pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+    prune_old_wheels "${WHEELS_DIR}"/triton*.whl
 
     # Install the wheel
     local _triton_wheel
@@ -1646,8 +1856,8 @@ patch_vllm_gfx1151() {
     log_step 20 "Patch vLLM for gfx1151 AITER support"
 
     # Apply all sed-type patches from YAML (AITER gfx1x imports, FA backend,
-    # ViT revert, FP8 linear disable, rms_norm guard, fusion skip_duplicates,
-    # sampler bypass, FLA chunk_delta_h fixes, qwen3_next warmup restriction)
+    # ViT revert, rms_norm guard, fusion skip_duplicates, sampler bypass,
+    # FLA chunk_delta_h fixes, qwen3_next warmup restriction)
     apply_patches vllm "${VLLM_SRC}"
 
     # Triton __repr__ patch — applied to INSTALLED package, not source tree.
@@ -1691,12 +1901,37 @@ with open('${_rotary}', 'w') as f:
         info "rotary_embedding/common.py: already patched or pattern not found"
     fi
 
+    # FP8 linear: disable AITER CK GEMM on gfx1x (file_rewrite, too complex for YAML sed)
+    # CK GEMM kernels (gemm_a8w8_blockscale) compile via JIT but crash at runtime
+    # with "Memory access fault... Page not present" — CDNA MFMA instructions
+    # don't exist on RDNA 3.5.  Falls through to Triton GEMM blockscale.
+    local _aiter_ops="${VLLM_SRC}/vllm/_aiter_ops.py"
+    if [[ -f "${_aiter_ops}" ]] && ! grep -q '# RDNA 3.5 (gfx1x): CK GEMM kernels crash with GPU page faults' "${_aiter_ops}"; then
+        info "Patching _aiter_ops.py: disable FP8 linear on gfx1x"
+        python3 -c "
+with open('${_aiter_ops}', 'r') as f:
+    content = f.read()
+old = '''    def is_linear_fp8_enabled(cls) -> bool:
+        return cls.is_linear_enabled()'''
+new = '''    def is_linear_fp8_enabled(cls) -> bool:
+        # RDNA 3.5 (gfx1x): CK GEMM kernels crash with GPU page faults
+        from vllm.platforms.rocm import on_gfx1x
+        if on_gfx1x():
+            return False
+        return cls.is_linear_enabled()'''
+content = content.replace(old, new, 1)
+with open('${_aiter_ops}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "_aiter_ops.py: FP8 linear gfx1x guard already present"
+    fi
+
     # RMSNorm Triton dispatch: Python-script patch (file_rewrite, too complex for YAML sed)
     # The CK RMSNorm (rocm_aiter.rmsnorm2d_fwd_*) uses CDNA asm that doesn't
     # exist on RDNA 3.5.  The Triton versions (aiter.ops.triton.normalization.
     # rmsnorm) work on all architectures but don't accept the
     # use_model_sensitive_rmsnorm=0 kwarg.  Dispatch based on architecture.
-    local _aiter_ops="${VLLM_SRC}/vllm/_aiter_ops.py"
     if [[ -f "${_aiter_ops}" ]] && ! grep -q 'aiter.ops.triton.normalization.rmsnorm' "${_aiter_ops}"; then
         info "Patching _aiter_ops.py: RMSNorm Triton dispatch for gfx1x"
         python3 -c "
@@ -2134,6 +2369,7 @@ build_vllm() {
         cd "${VLLM_DIR}"
         die "vLLM build failed. Check ${VLLM_LOG} for details."
     fi
+    prune_old_wheels "${WHEELS_DIR}"/vllm-*.whl
 
     # Install the vLLM wheel into the build venv
     local _vllm_wheel
@@ -2233,11 +2469,35 @@ build_flash_attention() {
     triton_loc_before="$(python -c "import triton; print(triton.__file__)" 2>/dev/null || echo 'none')"
     info "Triton location before FA build: ${triton_loc_before}"
 
+    # Apply patches from YAML (amdsmi prepend is step 27, handled by patch_flash_amdsmi)
+    apply_patches flash_attention "${FLASH_ATTN_SRC}"
+
+    # Patch setup.py to skip internal AITER install (we build AITER separately in step 28b)
+    local _fa_setup="${FLASH_ATTN_SRC}/setup.py"
+    if [[ -f "${_fa_setup}" ]] && ! grep -q '# PATCHED: skip aiter install' "${_fa_setup}"; then
+        info "Patching setup.py: skip internal AITER install (built separately in step 28b)"
+        python3 -c "
+with open('${_fa_setup}', 'r') as f:
+    content = f.read()
+old = '''        subprocess.run(
+            [sys.executable, \"-m\", \"pip\", \"install\", \"--no-build-isolation\", \"third_party/aiter\"],
+            check=True,
+        )'''
+new = '''        pass  # PATCHED: skip aiter install (built separately in step 28b)'''
+content = content.replace(old, new, 1)
+with open('${_fa_setup}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "setup.py: AITER install skip already applied"
+    fi
+
     # Install Flash Attention deps from YAML (excluding triton — we built it from source)
     install_pkg_deps flash_attention
 
     # Build wheel — no editable install, no triton download from PyPI
     pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+    prune_old_wheels "${WHEELS_DIR}"/flash_attn-*.whl
 
     # Install the wheel
     local _fa_wheel
@@ -2321,7 +2581,7 @@ rebuild_aiter() {
     # Clear stale JIT cache — the .cu interfaces are changing, so any
     # previously JIT-compiled .so files may reference the old CK ABI.
     local jit_dir
-    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null || echo '')"
+    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null | tail -1 || echo '')"
     if [[ -n "${jit_dir}" && -d "${jit_dir}" ]]; then
         local stale_count
         stale_count="$(find "${jit_dir}" -maxdepth 1 -name '*.so' -type f 2>/dev/null | wc -l)"
@@ -2341,6 +2601,7 @@ rebuild_aiter() {
     setup_build_env aiter
 
     pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+    prune_old_wheels "${WHEELS_DIR}"/amd_aiter-*.whl
 
     local _aiter_wheel
     _aiter_wheel="$(newest_wheel "${WHEELS_DIR}"/amd_aiter-*.whl)"
@@ -2986,7 +3247,7 @@ HIPREDUCE_EOF
     # Clear JIT cache after patching — stale .so files compiled against
     # unpatched headers will crash with illegal instruction on gfx1151.
     local jit_dir
-    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null || echo '')"
+    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null | tail -1 || echo '')"
     if [[ -n "${jit_dir}" && -d "${jit_dir}" ]]; then
         local stale_count
         stale_count="$(find "${jit_dir}" -maxdepth 1 -name '*.so' -type f 2>/dev/null | wc -l)"
@@ -3153,18 +3414,30 @@ warmup_aiter_jit() {
 
     # The JIT directory is where compiled .so files land
     local jit_dir
-    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null)"
+    jit_dir="$(python -c "from aiter.jit.core import get_user_jit_dir; print(get_user_jit_dir())" 2>/dev/null | tail -1)"
     if [[ -z "${jit_dir}" ]]; then
         warn "Cannot determine AITER JIT directory, skipping pre-warm"
         return 0
     fi
     info "AITER JIT directory: ${jit_dir}"
 
-    # Run the pre-warm script. This calls get_args_of_build("all") to enumerate
-    # buildable modules (auto-excludes CK-dependent ones), then build_module()
-    # for each one that doesn't already have a .so in the JIT directory.
-    # Each module takes 10-30 seconds to compile with hipcc.
-    python -c "
+    # Read the CDNA-only skip list from YAML. These modules use ISA instructions
+    # that don't exist on RDNA 3.5 and will never compile on gfx1151. Skipping
+    # them avoids wasting ~2.5 hours on guaranteed failures (module_mha_bwd and
+    # module_mha_varlen_bwd alone take ~70 min each to compile before failing).
+    local skip_list
+    skip_list="$(ycfg '.packages.aiter.jit_skip_modules[]' 2>/dev/null | paste -sd',' || true)"
+    info "Skipping ${skip_list:+$(echo "${skip_list}" | tr ',' '\n' | wc -l)} CDNA-only modules"
+
+    # Run from a temp directory — AITER's ninja build leaks a stray HIP CU ID
+    # object file (-.o) into the working directory. Using a temp dir prevents
+    # polluting the source tree.
+    local _prewarm_dir
+    _prewarm_dir="$(mktemp -d)"
+    cd "${_prewarm_dir}"
+
+    # Run the pre-warm script. Builds all modules except the skip list.
+    AITER_JIT_SKIP="${skip_list}" python -c "
 import os, sys, time
 
 from aiter.jit.core import get_args_of_build, build_module, get_user_jit_dir
@@ -3172,16 +3445,25 @@ from aiter.jit.core import get_args_of_build, build_module, get_user_jit_dir
 jit_dir = get_user_jit_dir()
 all_ops_list, d_all_ops = get_args_of_build('all')
 
+skip_modules = set(s.strip() for s in os.environ.get('AITER_JIT_SKIP', '').split(',') if s.strip())
+
 total = len(all_ops_list)
+buildable = total - sum(1 for m in all_ops_list if m['md_name'] in skip_modules)
 already_built = 0
 newly_built = 0
 failed = 0
+skipped = 0
 
-print(f'AITER JIT pre-warm: {total} buildable modules')
+print(f'AITER JIT pre-warm: {total} modules ({buildable} buildable, {len(skip_modules)} CDNA-only skipped)')
 
 for i, mod_cfg in enumerate(all_ops_list, 1):
     md_name = mod_cfg['md_name']
     so_path = os.path.join(jit_dir, f'{md_name}.so')
+
+    if md_name in skip_modules:
+        print(f'  [{i:2d}/{total}] {md_name}: skipped (CDNA-only)')
+        skipped += 1
+        continue
 
     if os.path.exists(so_path):
         print(f'  [{i:2d}/{total}] {md_name}: already built')
@@ -3191,9 +3473,6 @@ for i, mod_cfg in enumerate(all_ops_list, 1):
     print(f'  [{i:2d}/{total}] {md_name}: compiling...', flush=True)
     start = time.perf_counter()
     try:
-        # get_args_of_build for a single module returns the full config dict
-        # (not a list). The 'all' path returns per-module dicts with only
-        # md_name/srcs/flags/includes — we need the full defaults too.
         d_args = get_args_of_build(md_name)
         build_module(
             md_name=md_name,
@@ -3216,7 +3495,7 @@ for i, mod_cfg in enumerate(all_ops_list, 1):
         else:
             print(f'           build_module returned but .so not found ({elapsed:.1f}s)')
             failed += 1
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         elapsed = time.perf_counter() - start
         print(f'           FAILED ({elapsed:.1f}s): {e}')
         failed += 1
@@ -3225,13 +3504,18 @@ print()
 print(f'AITER JIT pre-warm complete:')
 print(f'  Already built: {already_built}')
 print(f'  Newly built:   {newly_built}')
+print(f'  Skipped:       {skipped} (CDNA-only, no gfx1151 support)')
 print(f'  Failed:        {failed}')
 print(f'  Total:         {total}')
 
 if failed > 0:
-    print(f'WARNING: {failed} modules failed to compile. These will JIT-compile on first use.')
-    sys.exit(0)  # Non-fatal — modules will JIT-compile on demand
-" || warn "AITER JIT pre-warm had errors (modules will JIT-compile on first use)"
+    print(f'NOTE: {failed} unexpected failures. Check build log for details.')
+    sys.exit(0)
+" || warn "AITER JIT pre-warm had unexpected failures"
+
+    # Clean up temp directory (may contain stray -.o from HIP CU ID generation)
+    cd "${VLLM_DIR}"
+    rm -rf "${_prewarm_dir}"
 
     # Report final count
     local built_count
@@ -3422,12 +3706,15 @@ build_rust_wheels() {
             --no-deps \
             --wheel-dir "${WHEELS_DIR}" \
             -v
+        prune_old_wheels "${WHEELS_DIR}"/orjson-*.whl
         _orjson_wheel="$(newest_wheel "${WHEELS_DIR}"/orjson-*.whl)"
         if [[ -z "${_orjson_wheel}" ]]; then
             die "orjson wheel build failed"
         fi
         success "orjson wheel built: $(basename "${_orjson_wheel}")"
     fi
+    # Install into venv (replace any existing version)
+    uv pip install --force-reinstall --no-deps "${_orjson_wheel}"
 
     # cryptography: Rust/C library for ChaCha20-Poly1305 encryption of
     # encrypted data payloads. VAES target feature enables 4x parallel
@@ -3445,12 +3732,15 @@ build_rust_wheels() {
             --no-deps \
             --wheel-dir "${WHEELS_DIR}" \
             -v
+        prune_old_wheels "${WHEELS_DIR}"/cryptography-*.whl
         _crypto_wheel="$(newest_wheel "${WHEELS_DIR}"/cryptography-*.whl)"
         if [[ -z "${_crypto_wheel}" ]]; then
             die "cryptography wheel build failed"
         fi
         success "cryptography wheel built: $(basename "${_crypto_wheel}")"
     fi
+    # Install into venv (replace any existing version)
+    uv pip install --force-reinstall --no-deps "${_crypto_wheel}"
 
     unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
 
@@ -3523,30 +3813,27 @@ build_native_wheels() {
     )
 
     for _pkg in "${_packages[@]}"; do
-        local _existing_wheel
-        _existing_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
-        if [[ -n "${_existing_wheel}" ]]; then
-            info "${_pkg} wheel already exists: $(basename "${_existing_wheel}")"
-            continue
-        fi
-
-        info "Building ${_pkg} from source with Zen 5 optimizations..."
-        if pip wheel "${_pkg}" \
-            --no-binary "${_pkg}" \
-            --no-cache-dir \
-            --no-deps \
-            --wheel-dir "${WHEELS_DIR}" \
-            -v; then
-            local _built_wheel
-            _built_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
-            if [[ -n "${_built_wheel}" ]]; then
-                success "${_pkg} wheel built: $(basename "${_built_wheel}")"
-            else
-                warn "${_pkg} wheel not found after build (may have different filename)"
-            fi
+        local _pkg_wheel
+        _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
+        if [[ -n "${_pkg_wheel}" ]]; then
+            info "${_pkg} wheel already exists: $(basename "${_pkg_wheel}")"
         else
-            warn "${_pkg} source build failed — will use PyPI binary wheel as fallback"
+            info "Building ${_pkg} from source with Zen 5 optimizations..."
+            pip wheel "${_pkg}" \
+                --no-binary "${_pkg}" \
+                --no-cache-dir \
+                --no-deps \
+                --wheel-dir "${WHEELS_DIR}" \
+                -v
+            prune_old_wheels "${WHEELS_DIR}"/"${_pkg}"-*.whl
+            _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
+            if [[ -z "${_pkg_wheel}" ]]; then
+                die "${_pkg} wheel not found after build"
+            fi
+            success "${_pkg} wheel built: $(basename "${_pkg_wheel}")"
         fi
+        # Install into venv (replace any existing version with optimized build)
+        uv pip install --force-reinstall --no-deps "${_pkg_wheel}"
     done
 
     # Restore original CFLAGS/LDFLAGS with driver-level flags
@@ -3567,99 +3854,75 @@ export_source_wheels() {
     if [[ -n "${_torch_wheel}" ]]; then
         success "torch wheel exists: $(basename "${_torch_wheel}")"
     else
-        # PyTorch is currently an editable install — build the wheel now.
-        # This uses the ALREADY-COMPILED build tree, so cmake won't re-run
-        # (the .so files are all built). Only the packaging step runs.
-        if [[ -d "${PYTORCH_SRC}" ]]; then
-            info "Building PyTorch wheel from existing build tree..."
-            cd "${PYTORCH_SRC}"
-            pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
-            _torch_wheel="$(newest_wheel "${WHEELS_DIR}"/torch-*.whl)"
-            if [[ -n "${_torch_wheel}" ]]; then
-                success "torch wheel built: $(basename "${_torch_wheel}")"
-            else
-                warn "torch wheel packaging produced no output"
-            fi
-            cd "${VLLM_DIR}"
-        else
-            warn "PyTorch source not found at ${PYTORCH_SRC} — cannot build wheel"
-        fi
+        [[ -d "${PYTORCH_SRC}" ]] || die "PyTorch source not found at ${PYTORCH_SRC}"
+        info "Building PyTorch wheel from existing build tree..."
+        cd "${PYTORCH_SRC}"
+        pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+        prune_old_wheels "${WHEELS_DIR}"/torch-*.whl
+        _torch_wheel="$(newest_wheel "${WHEELS_DIR}"/torch-*.whl)"
+        [[ -n "${_torch_wheel}" ]] || die "torch wheel not found after build"
+        success "torch wheel built: $(basename "${_torch_wheel}")"
+        cd "${VLLM_DIR}"
     fi
 
-    # Triton wheel: should already exist from step 13.
+    # Triton wheel: should already exist from step 15.
     local _triton_wheel
     _triton_wheel="$(newest_wheel "${WHEELS_DIR}"/triton*.whl)"
     if [[ -n "${_triton_wheel}" ]]; then
         success "triton wheel exists: $(basename "${_triton_wheel}")"
     else
-        if [[ -d "${TRITON_SRC}" ]]; then
-            info "Building Triton wheel from existing build tree..."
-            local triton_pkg_dir="${TRITON_SRC}"
-            if [[ -f "${TRITON_SRC}/python/setup.py" && ! -f "${TRITON_SRC}/setup.py" ]]; then
-                triton_pkg_dir="${TRITON_SRC}/python"
-            fi
-            cd "${triton_pkg_dir}"
-            pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
-            _triton_wheel="$(newest_wheel "${WHEELS_DIR}"/triton*.whl)"
-            if [[ -n "${_triton_wheel}" ]]; then
-                success "triton wheel built: $(basename "${_triton_wheel}")"
-            else
-                warn "triton wheel packaging failed"
-            fi
-            cd "${VLLM_DIR}"
-        else
-            warn "Triton source not found at ${TRITON_SRC} — cannot build wheel"
+        [[ -d "${TRITON_SRC}" ]] || die "Triton source not found at ${TRITON_SRC}"
+        info "Building Triton wheel from existing build tree..."
+        local triton_pkg_dir="${TRITON_SRC}"
+        if [[ -f "${TRITON_SRC}/python/setup.py" && ! -f "${TRITON_SRC}/setup.py" ]]; then
+            triton_pkg_dir="${TRITON_SRC}/python"
         fi
+        cd "${triton_pkg_dir}"
+        pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+        prune_old_wheels "${WHEELS_DIR}"/triton*.whl
+        _triton_wheel="$(newest_wheel "${WHEELS_DIR}"/triton*.whl)"
+        [[ -n "${_triton_wheel}" ]] || die "triton wheel not found after build"
+        success "triton wheel built: $(basename "${_triton_wheel}")"
+        cd "${VLLM_DIR}"
     fi
 
-    # TorchVision wheel: should already exist from step 13, verify it's there.
+    # TorchVision wheel: should already exist from step 13.
     local _tv_wheel
     _tv_wheel="$(newest_wheel "${WHEELS_DIR}"/torchvision-*.whl)"
     if [[ -n "${_tv_wheel}" ]]; then
         success "torchvision wheel exists: $(basename "${_tv_wheel}")"
     else
-        if [[ -d "${TORCHVISION_SRC}" ]]; then
-            info "Building TorchVision wheel from existing build tree..."
-            cd "${TORCHVISION_SRC}"
-            pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
-            _tv_wheel="$(newest_wheel "${WHEELS_DIR}"/torchvision-*.whl)"
-            if [[ -n "${_tv_wheel}" ]]; then
-                success "torchvision wheel built: $(basename "${_tv_wheel}")"
-            else
-                warn "torchvision wheel packaging failed"
-            fi
-            cd "${VLLM_DIR}"
-        else
-            warn "TorchVision source not found at ${TORCHVISION_SRC} — cannot build wheel"
-        fi
+        [[ -d "${TORCHVISION_SRC}" ]] || die "TorchVision source not found at ${TORCHVISION_SRC}"
+        info "Building TorchVision wheel from existing build tree..."
+        cd "${TORCHVISION_SRC}"
+        pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+        prune_old_wheels "${WHEELS_DIR}"/torchvision-*.whl
+        _tv_wheel="$(newest_wheel "${WHEELS_DIR}"/torchvision-*.whl)"
+        [[ -n "${_tv_wheel}" ]] || die "torchvision wheel not found after build"
+        success "torchvision wheel built: $(basename "${_tv_wheel}")"
+        cd "${VLLM_DIR}"
     fi
 
-    # amd-aiter wheel: build from the installed site-packages source.
-    # AITER was installed as part of the vLLM build (step 24).
+    # amd-aiter wheel: should already exist from step 28b.
     local _aiter_wheel
     _aiter_wheel="$(newest_wheel "${WHEELS_DIR}"/amd_aiter-*.whl)"
     if [[ -n "${_aiter_wheel}" ]]; then
         success "amd-aiter wheel exists: $(basename "${_aiter_wheel}")"
     else
-        # AITER source lives in the vLLM repo under third_party/aiter
         local _aiter_src="${VLLM_DIR}/vllm/third_party/aiter"
         if [[ ! -d "${_aiter_src}" ]]; then
-            # Fallback: check if it was cloned standalone
             _aiter_src="${VLLM_DIR}/aiter"
         fi
-        if [[ -d "${_aiter_src}" && -f "${_aiter_src}/setup.py" ]]; then
-            info "Building amd-aiter wheel..."
-            cd "${_aiter_src}"
-            pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v || \
-                warn "amd-aiter wheel build failed (AITER JIT-compiles at runtime anyway)"
-            _aiter_wheel="$(newest_wheel "${WHEELS_DIR}"/amd_aiter-*.whl)"
-            if [[ -n "${_aiter_wheel}" ]]; then
-                success "amd-aiter wheel built: $(basename "${_aiter_wheel}")"
-            fi
-            cd "${VLLM_DIR}"
-        else
-            info "AITER source not found — AITER JIT-compiles kernels at runtime, wheel is optional"
-        fi
+        [[ -d "${_aiter_src}" && -f "${_aiter_src}/setup.py" ]] \
+            || die "AITER source not found — cannot build wheel"
+        info "Building amd-aiter wheel..."
+        cd "${_aiter_src}"
+        pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+        prune_old_wheels "${WHEELS_DIR}"/amd_aiter-*.whl
+        _aiter_wheel="$(newest_wheel "${WHEELS_DIR}"/amd_aiter-*.whl)"
+        [[ -n "${_aiter_wheel}" ]] || die "amd-aiter wheel not found after build"
+        success "amd-aiter wheel built: $(basename "${_aiter_wheel}")"
+        cd "${VLLM_DIR}"
     fi
 
     # amdsmi wheel: build from TheRock's share/amd_smi.
@@ -3669,30 +3932,42 @@ export_source_wheels() {
         success "amdsmi wheel exists: $(basename "${_amdsmi_wheel}")"
     else
         local _amdsmi_src="${LOCAL_PREFIX}/share/amd_smi"
-        if [[ -d "${_amdsmi_src}" && -f "${_amdsmi_src}/setup.py" ]]; then
-            info "Building amdsmi wheel from ${_amdsmi_src}..."
-            cd "${_amdsmi_src}"
-            pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v || \
-                warn "amdsmi wheel build failed"
-            _amdsmi_wheel="$(newest_wheel "${WHEELS_DIR}"/amdsmi-*.whl)"
-            if [[ -n "${_amdsmi_wheel}" ]]; then
-                success "amdsmi wheel built: $(basename "${_amdsmi_wheel}")"
-            fi
-            cd "${VLLM_DIR}"
-        else
-            warn "amdsmi source not found at ${_amdsmi_src}"
-        fi
+        [[ -d "${_amdsmi_src}" && -f "${_amdsmi_src}/setup.py" ]] \
+            || die "amdsmi source not found at ${_amdsmi_src}"
+        info "Building amdsmi wheel from ${_amdsmi_src}..."
+        cd "${_amdsmi_src}"
+        pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
+        prune_old_wheels "${WHEELS_DIR}"/amdsmi-*.whl
+        _amdsmi_wheel="$(newest_wheel "${WHEELS_DIR}"/amdsmi-*.whl)"
+        [[ -n "${_amdsmi_wheel}" ]] || die "amdsmi wheel not found after build"
+        success "amdsmi wheel built: $(basename "${_amdsmi_wheel}")"
+        cd "${VLLM_DIR}"
     fi
 
-    # Summary
+    # Verify all required wheels exist (built in earlier steps)
+    local _vllm_wheel _fa_wheel
+    _vllm_wheel="$(newest_wheel "${WHEELS_DIR}"/vllm-*.whl)"
+    [[ -n "${_vllm_wheel}" ]] || die "vLLM wheel missing from ${WHEELS_DIR} — run step 24 first"
+    success "vllm wheel exists: $(basename "${_vllm_wheel}")"
+
+    _fa_wheel="$(newest_wheel "${WHEELS_DIR}"/flash_attn-*.whl)"
+    [[ -n "${_fa_wheel}" ]] || die "flash_attn wheel missing from ${WHEELS_DIR} — run step 28 first"
+    success "flash_attn wheel exists: $(basename "${_fa_wheel}")"
+
+    # Summary — verify all 13 packages are present
+    local _wheel_count
+    _wheel_count="$(compgen -G "${WHEELS_DIR}/*.whl" | wc -l)"
     echo ""
-    info "Wheels in ${WHEELS_DIR}:"
+    info "Wheels in ${WHEELS_DIR} (${_wheel_count} total):"
     for _whl in "${WHEELS_DIR}"/*.whl; do
         [[ -f "${_whl}" ]] || continue
         info "  $(basename "${_whl}")"
     done
+    if [[ "${_wheel_count}" -lt 13 ]]; then
+        die "Expected at least 13 wheels, found ${_wheel_count}. Check build log for failures."
+    fi
 
-    success "Source wheel export complete"
+    success "Source wheel export complete — all ${_wheel_count} wheels verified"
 }
 
 # =============================================================================

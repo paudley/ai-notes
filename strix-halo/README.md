@@ -36,9 +36,10 @@ RDNA 3.5 firmware and drm driver changes.
 | **Python** | Built from source (3.13.x, PGO + LTO + amdclang) |
 | **ROCm** | Built from source (TheRock nightly) |
 
-Other distributions should work provided the kernel is 7.0+ with the
-`amdgpu` and `amdxdna` modules loaded, and the system packages listed
-below are available.
+Ubuntu and Fedora are also supported — the build script detects the distro
+and provides the correct package install commands. Any distribution should
+work provided the kernel is 7.0+ with the `amdgpu` and `amdxdna` modules
+loaded.
 
 ## Performance (gfx1151, 40 CUs, unified LPDDR5X)
 
@@ -137,17 +138,49 @@ Both backends are installed into the venv and Lemonade can route between
 them based on workload. Each backend gets its own `.env` file with
 gfx1151 runtime optimizations (batch sizing, hipBLASLt, THP).
 
+## Supported Distributions
+
+The build script auto-detects the distro via `/etc/os-release` and adapts
+prerequisite checks and install hints accordingly.
+
+| Family | Distros | Package Manager |
+|--------|---------|-----------------|
+| **Arch** | CachyOS, Arch, EndeavourOS, Manjaro, Garuda | pacman |
+| **Ubuntu** | Ubuntu, Debian, Linux Mint, Pop!_OS, Elementary, Zorin | apt |
+| **Fedora** | Fedora, Nobara, RHEL, CentOS, Rocky, Alma | dnf |
+
+`uv` and `yq` are **auto-bootstrapped** if not found on PATH. The script
+tries `go install` first (always gets latest), then falls back to
+downloading the latest release binary from GitHub. Both tools are also
+installed into the venv for self-contained builds.
+
 ## Quick Start
 
 ```bash
-# 1. Install system prerequisites (CachyOS / Arch Linux)
-sudo pacman -S clang lld cmake ninja git curl uv \
-    gcc-fortran patchelf automake libtool bison flex xxd scons \
-    vulkan-devel vulkan-radeon   # For Vulkan llama.cpp backend
+# 1. Install system prerequisites
+#    The build script will tell you exactly what's missing, but here are
+#    the full install commands for each distro family:
 
-# 2. Install CachyOS RC kernel (for gfx1151 amdgpu support)
+# Arch / CachyOS:
+sudo pacman -S clang lld cmake ninja git curl \
+    gcc-fortran patchelf automake libtool bison flex xxd scons meson \
+    vulkan-devel vulkan-radeon
+
+# Ubuntu / Debian:
+sudo apt install clang lld cmake ninja-build git curl \
+    gfortran patchelf automake libtool bison flex xxd scons meson \
+    libvulkan-dev mesa-vulkan-drivers
+
+# Fedora / RHEL:
+sudo dnf install clang lld cmake ninja-build git curl \
+    gcc-gfortran patchelf automake libtool bison flex vim-common scons meson \
+    vulkan-devel mesa-vulkan-drivers
+
+# 2. Install a kernel with gfx1151 amdgpu support (kernel 7.0+)
 #    Skip if already running kernel 7.0+
-sudo pacman -S linux-cachyos-rc linux-cachyos-rc-headers
+#    Arch:   sudo pacman -S linux-cachyos-rc linux-cachyos-rc-headers
+#    Ubuntu: Use mainline kernel PPA or HWE kernel >= 7.0
+#    Fedora: Rawhide or kernel-next >= 7.0
 
 # 3. Create the build directory (all source lives under /opt/src/vllm)
 sudo mkdir -p /opt/src/vllm
@@ -208,13 +241,14 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 |------|-------------|
 | `build-vllm.sh` | Master build script (35-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
-| `vllm-packages.yaml` | Package manifest (repos, branches, patches, build metadata) |
+| `vllm-packages.yaml` | Package manifest (repos, branches, patches, per-distro prerequisites, bootstrap config) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
 | `vllm-stop.sh` | Stop all running vLLM instances (graceful SIGTERM + SIGKILL) |
 | `vllm-status.sh` | Check health/PID/model status of all vLLM instances |
 | `common.sh` | Shared shell helpers (logging, section headers, prerequisite checks) |
 | `vllm-runtime-helpers.sh` | Shared library for start/stop/status scripts |
 | `BUILD-FIXES.md` | Detailed documentation of all build patches and workarounds |
+| `CHANGELOG.md` | Version history and notable changes |
 
 ## Repo Variants
 
@@ -243,40 +277,78 @@ When complete, the build produces 13 optimized wheel packages:
 
 | Wheel | Size | Type |
 |-------|------|------|
-| torch | 681M | C++/HIP |
-| triton | 227M | C++/LLVM |
-| vllm | 50M | C++/HIP |
-| torchvision | ~30M | C++ |
-| numpy | 7.4M | C (meson) |
+| torch | 647M | C++/HIP |
+| triton | 217M | C++/LLVM |
+| vllm | 48M | C++/HIP |
+| amd-aiter | 43M | C++/HIP |
+| numpy | 7.1M | C (meson) |
 | cryptography | 2.4M | Rust |
 | sentencepiece | 1.5M | C++ (cmake) |
 | amdsmi | 1.4M | Pure Python |
-| zstandard | 961K | C |
-| asyncpg | 845K | Cython |
-| orjson | 349K | Rust |
-| flash_attn | 206K | Pure Python |
-| amd-aiter | ~2M | C++/HIP |
+| torchvision | 1.3M | C++ |
+| zstandard | 940K | C |
+| asyncpg | 828K | Cython |
+| orjson | 344K | Rust |
+| flash_attn | 204K | Pure Python |
 
 All wheels are in `/opt/src/vllm/wheels/` and can be installed into any
 Python 3.13 venv.
 
 ## Using the Built Wheels
 
-### Quick: pip
+The build produces two key artifacts:
+
+1. **Optimized CPython 3.13** at `/opt/src/vllm/python/bin/python3`
+   (PGO + ThinLTO + amdclang `-famd-opt`, Zen 5 native)
+2. **13 optimized wheel packages** in `/opt/src/vllm/wheels/`
+
+Both are portable to any environment on the same machine (or any machine
+with the same architecture and ROCm libraries at `/opt/src/vllm/local/lib`).
+
+### Quick: pip install into any venv
 
 ```bash
+# From any activated venv (Python 3.13 required)
 pip install /opt/src/vllm/wheels/*.whl
 ```
 
-### Recommended: uv with find-links
+### Full Setup: New project with optimized Python + wheels
 
-Add to your project's `pyproject.toml` to have uv automatically resolve
-source-built wheels from the local directory instead of PyPI:
+This is the recommended approach for maximum performance — the optimized
+Python interpreter alone provides ~5-15% speedup on compute-bound code.
+
+```bash
+# 1. Create a new project with the source-built Python
+mkdir my-project && cd my-project
+uv venv --python /opt/src/vllm/python/bin/python3 .venv
+source .venv/bin/activate
+
+# 2. Install all optimized wheels
+uv pip install /opt/src/vllm/wheels/*.whl
+
+# 3. Verify
+python -c "import torch; print(f'PyTorch {torch.__version__}, ROCm {torch.version.hip}')"
+python -c "import vllm; print(f'vLLM {vllm.__version__}')"
+```
+
+### Recommended: uv project with find-links
+
+For uv-managed projects, add to `pyproject.toml` to have uv automatically
+resolve source-built wheels from the local directory instead of PyPI:
 
 ```toml
+[project]
+requires-python = ">=3.13"
+dependencies = [
+    "vllm",
+    "torch",
+    "numpy",
+]
+
 [tool.uv]
 find-links = ["/opt/src/vllm/wheels"]
 prerelease = "if-necessary-or-explicit"
+python-preference = "only-system"
 
 override-dependencies = [
     # Source-built ROCm wheels (dev versions resolved via find-links)
@@ -285,35 +357,58 @@ override-dependencies = [
     "torchvision==0.26.0a0+5328524",
     "vllm==0.17.1rc1.dev169+g6590a3ecd.d20260315.rocm713",
     "flash-attn==2.8.4",
-    "amd-aiter==0.1.0+gitabcdef",
+    "amd-aiter==0.1.11.dev32+g9a469a608.d20260317",
     "amdsmi==26.3.0+093b66caa3.dirty",
     # Zen 5 optimized native wheels
     "numpy==2.4.3",
+    "cryptography==46.0.5",
+    "orjson==3.11.7",
+    "sentencepiece==0.2.1",
+    "zstandard==0.25.0",
+    "asyncpg==0.31.0",
 ]
 ```
 
-The `find-links` directive tells uv to check the local wheel directory
-before PyPI. The `override-dependencies` pins exact versions (including
-dev/pre-release suffixes like `2.12.0a0+git...`) so uv resolves to the
-local wheels. The `prerelease` setting is needed because source builds
-produce pre-release version strings by default.
-
-Update the version strings after each rebuild — they change with every
-git commit in the upstream repos.
-
-### Using the Source-Built Python
-
-The build produces an optimized CPython 3.13 at
-`/opt/src/vllm/python/bin/python3` (PGO + ThinLTO + amdclang). To use
-it with uv:
+Then create the venv with the optimized Python:
 
 ```bash
-# Create a venv using the source-built Python
-uv venv --python /opt/src/vllm/python/bin/python3 .venv
-source .venv/bin/activate
+# Point uv at the source-built Python
+uv venv --python /opt/src/vllm/python/bin/python3
+uv sync
+```
 
-# Install all built wheels
-uv pip install /opt/src/vllm/wheels/*.whl
+**How this works:**
+- `find-links` tells uv to check the local wheel directory before PyPI
+- `override-dependencies` pins exact versions (including dev/pre-release
+  suffixes like `2.12.0a0+git...`) so uv resolves to the local wheels
+- `prerelease = "if-necessary-or-explicit"` is needed because source
+  builds produce pre-release version strings by default
+- `python-preference = "only-system"` prevents uv from downloading a
+  generic Python when the optimized one is available
+
+Update the version strings after each rebuild — they change with every
+git commit in the upstream repos. To get current versions:
+
+```bash
+ls /opt/src/vllm/wheels/*.whl | xargs -I{} basename {} | sed 's/-cp313.*//'
+```
+
+### Runtime Environment
+
+The ROCm wheels need the TheRock libraries at runtime. Source
+`vllm-env.sh` to set up all paths, or manually set:
+
+```bash
+export LD_LIBRARY_PATH="/opt/src/vllm/local/lib:${LD_LIBRARY_PATH}"
+export HSA_OVERRIDE_GFX_VERSION=11.5.1    # For gfx1151
+export ROCBLAS_USE_HIPBLASLT=1
+export VLLM_USE_TRITON_FLASH_ATTN=0       # Use AITER attention
+```
+
+Or simply source the activation script:
+
+```bash
+source /path/to/strix-halo/vllm-env.sh
 ```
 
 ## Runtime Management
