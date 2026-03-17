@@ -18,7 +18,27 @@ flags targeting the Strix Halo microarchitecture.
 | **GPU** | RDNA 3.5 iGPU, gfx1151, 40 CUs |
 | **Memory** | 64-128 GB unified LPDDR5X |
 | **Disk** | ~100 GB free for build artifacts |
-| **Kernel** | Linux 7.0+ (amdgpu + amdxdna loaded) |
+| **Kernel** | Linux 7.0-rc3+ (amdgpu + amdxdna loaded) |
+
+## Tested Platform
+
+This build is developed and tested on **CachyOS** (Arch-based) with the
+**CachyOS kernel 7.0-rc3** (`linux-cachyos-rc`). CachyOS ships patched
+kernels with up-to-date amdgpu and amdxdna driver support that gfx1151
+requires — mainline kernels prior to 7.0 do not include the necessary
+RDNA 3.5 firmware and drm driver changes.
+
+| Component | Version |
+|-----------|---------|
+| **Distro** | CachyOS (Arch-based, rolling) |
+| **Kernel** | 7.0.0-rc3-2-cachyos-rc (`linux-cachyos-rc`) |
+| **Compiler** | Clang/LLVM 21+ (system), then amdclang from TheRock |
+| **Python** | Built from source (3.13.x, PGO + LTO + amdclang) |
+| **ROCm** | Built from source (TheRock nightly) |
+
+Other distributions should work provided the kernel is 7.0+ with the
+`amdgpu` and `amdxdna` modules loaded, and the system packages listed
+below are available.
 
 ## Performance (gfx1151, 40 CUs, unified LPDDR5X)
 
@@ -29,7 +49,7 @@ Benchmarked with FULL CUDA graph capture, ALL AITER optimizations
 |-------|-----------|-------|---------------|
 | Qwen2.5-0.5B-Instruct | 494M | 1059.8 | FULL graph + ALL AITER |
 | Qwen2.5-1.5B-Instruct | 1.5B | 391.6 | FULL graph + ALL AITER |
-| Qwen3.5-0.8B (MoE) | 0.8B active / 3B total | 285.5 | enforce_eager (FLA kernels, see patches 9-10) |
+| Qwen3.5-0.8B (MoE) | 0.8B active / 3B total | 285.5 | enforce_eager (FLA + hybrid model patches, see BUILD-FIXES.md #42-43, #49-51) |
 
 These numbers represent steady-state decode throughput (8 concurrent
 prompts, 128 max tokens, after 2 warmup passes). The build patches in
@@ -53,7 +73,7 @@ that force PIECEWISE graph mode with AITER disabled.
    flag (proprietary Zen microarchitecture tuning not available in
    upstream LLVM).
 
-## Build Pipeline (32 Steps, 8 Phases)
+## Build Pipeline (35 Steps, 9 Phases)
 
 ```
 Phase A: ROCm SDK (TheRock)
@@ -95,24 +115,48 @@ Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
  30. Build Rust wheels     (orjson, cryptography — AVX-512 + VAES)
  31. Build C/C++ wheels    (numpy, sentencepiece, zstandard, asyncpg)
  32. Export source wheels   (torch, triton, torchvision, amd-aiter, amdsmi)
+
+Phase I: Lemonade Inference Server
+ 33. Clone Lemonade + build llama.cpp (ROCm hipBLAS + Vulkan backends)
+ 34. Install Lemonade SDK from PyPI
+ 35. Validate Lemonade (both backends)
 ```
+
+### Lemonade: Dual-Backend llama.cpp
+
+Phase I builds [llama.cpp](https://github.com/ggml-org/llama.cpp) with
+two GPU backends, managed by the
+[Lemonade SDK](https://pypi.org/project/lemonade-sdk/):
+
+| Backend | Best For | Notes |
+|---------|----------|-------|
+| **ROCm** (hipBLAS) | Prefill < 32K context | Primary backend, uses amdclang + gfx1151 HIP flags |
+| **Vulkan** | Generation speed, prefill > 32K | +22% tok/s generation, no 32K VMM limitation |
+
+Both backends are installed into the venv and Lemonade can route between
+them based on workload. Each backend gets its own `.env` file with
+gfx1151 runtime optimizations (batch sizing, hipBLASLt, THP).
 
 ## Quick Start
 
 ```bash
-# 1. Install system prerequisites
-#    Arch Linux / CachyOS:
+# 1. Install system prerequisites (CachyOS / Arch Linux)
 sudo pacman -S clang lld cmake ninja git curl uv \
-    gcc-fortran patchelf automake libtool bison flex xxd scons
+    gcc-fortran patchelf automake libtool bison flex xxd scons \
+    vulkan-devel vulkan-radeon   # For Vulkan llama.cpp backend
 
-# 2. Create the build directory
+# 2. Install CachyOS RC kernel (for gfx1151 amdgpu support)
+#    Skip if already running kernel 7.0+
+sudo pacman -S linux-cachyos-rc linux-cachyos-rc-headers
+
+# 3. Create the build directory (all source lives under /opt/src/vllm)
 sudo mkdir -p /opt/src/vllm
 sudo chown $(id -u):$(id -g) /opt/src/vllm
 
-# 3. Run the full build
+# 4. Run the full build
 ./build-vllm.sh
 
-# 4. Activate the environment (for interactive use)
+# 5. Activate the environment (for interactive use)
 source ./vllm-env.sh
 source ./vllm-env.sh --info   # Show settings
 ```
@@ -162,7 +206,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 
 | File | Description |
 |------|-------------|
-| `build-vllm.sh` | Master build script (32-step pipeline) |
+| `build-vllm.sh` | Master build script (35-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
 | `vllm-packages.yaml` | Package manifest (repos, branches, patches, build metadata) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
@@ -185,6 +229,8 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 | AOTriton | ROCm/aotriton | main |
 | AOCL-LibM | amd/aocl-libm-ose | main |
 | AOCL-Utils | amd/aocl-utils | main |
+| llama.cpp | ggml-org/llama.cpp | master |
+| Lemonade | lemonade-sdk/lemonade | v10.0.0 |
 
 Note: PyTorch, Triton, and Flash Attention use the **ROCm forks**, not
 upstream. The ROCm forks carry AMD-specific fixes (hipify patches, Tensile

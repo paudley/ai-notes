@@ -296,6 +296,48 @@ export MIOPEN_FIND_MODE=2
 export AMDGCN_USE_BUFFER_OPS=1
 
 # =============================================================================
+# Rust Compiler Flags (Zen 5)
+# =============================================================================
+# target-cpu=znver5 explicitly (not 'native') because Rust's native detection
+# has a bug where it identifies znver5 but only enables SSE2. Explicit znver5
+# gives us all 40+ target features: AVX-512{F,BW,DQ,VL,VNNI,IFMA,VBMI,VBMI2,
+# BITALG,BF16,VPOPCNTDQ,VP2INTERSECT}, VAES, VPCLMULQDQ, GFNI, SHA.
+#
+# Do NOT add -C lto=thin — maturin adds -C embed-bitcode=no which conflicts.
+export RUSTFLAGS="-C target-cpu=znver5 -C opt-level=3"
+
+# =============================================================================
+# AOTriton Install Prefix
+# =============================================================================
+# AOTriton installs to the unified LOCAL_PREFIX alongside TheRock and AOCL.
+# PyTorch's cmake discovery and vLLM's build both need this to find
+# libaotriton.so and the AOTriton cmake config.
+export AOTRITON_INSTALL_DIR="${_LOCAL_PREFIX}"
+
+# =============================================================================
+# Lemonade / llama.cpp Configuration
+# =============================================================================
+# Lemonade wraps llama.cpp (GPU/CPU), FLM (NPU), and ONNX behind an
+# OpenAI-compatible API. The llama-server binary lives at
+# ${VLLM_VENV}/rocm/llama_server/ with a .env file for runtime optimizations.
+
+# ROCm backend (primary — hipBLAS, best prefill <32K context)
+_LLAMACPP_ROCM="${VLLM_VENV}/rocm/llama_server"
+if [[ -d "${_LLAMACPP_ROCM}" ]]; then
+    export LEMONADE_LLAMACPP_DIR="${_LLAMACPP_ROCM}"
+    export PATH="${_LLAMACPP_ROCM}:${PATH}"
+    export LD_LIBRARY_PATH="${_LLAMACPP_ROCM}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+# Vulkan backend (best generation speed + prefill >32K context on gfx1151)
+_LLAMACPP_VULKAN="${VLLM_VENV}/vulkan/llama_server"
+if [[ -d "${_LLAMACPP_VULKAN}" ]]; then
+    export LEMONADE_LLAMACPP_VULKAN_DIR="${_LLAMACPP_VULKAN}"
+    export LD_LIBRARY_PATH="${_LLAMACPP_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+unset _LLAMACPP_ROCM _LLAMACPP_VULKAN
+
+# =============================================================================
 # Virtual Environment Activation
 # =============================================================================
 
@@ -353,8 +395,28 @@ if [[ "${1:-}" == "--info" ]]; then
     echo "    TunableOp:        ${PYTORCH_TUNABLEOP_ENABLED:-disabled}"
     echo "    TunableOp file:   ${PYTORCH_TUNABLEOP_FILENAME:-<not set>}"
     echo ""
+    echo "  Rust:"
+    echo "    RUSTFLAGS:        ${RUSTFLAGS}"
+    echo ""
     echo "  Triton Compiler:"
     echo "    Buffer ops:       ${AMDGCN_USE_BUFFER_OPS:-disabled}"
+    echo ""
+    echo "  Lemonade / llama.cpp:"
+    echo "    ROCm backend:     ${LEMONADE_LLAMACPP_DIR:-<not built>}"
+    echo "    Vulkan backend:   ${LEMONADE_LLAMACPP_VULKAN_DIR:-<not built>}"
+    echo "    llama-server:     $(command -v llama-server 2>/dev/null || echo 'not in PATH')"
+    echo "    llama-bench:      $(command -v llama-bench 2>/dev/null || echo 'not in PATH')"
+    echo "    llama-quantize:   $(command -v llama-quantize 2>/dev/null || echo 'not in PATH')"
+    if [[ -f "${LEMONADE_LLAMACPP_DIR:-.}/.env" ]]; then
+        echo "    ROCm .env:        present"
+    else
+        echo "    ROCm .env:        not found"
+    fi
+    if [[ -f "${LEMONADE_LLAMACPP_VULKAN_DIR:-.}/.env" ]]; then
+        echo "    Vulkan .env:      present"
+    else
+        echo "    Vulkan .env:      not found"
+    fi
     echo ""
     echo "  Runtime:"
     echo "    VENV active:      $(command -v python 2>/dev/null || echo 'no')"

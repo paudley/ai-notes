@@ -268,9 +268,9 @@ line at the end of CMakeLists.txt (accidentally committed).
 
 **Fix**: `sed -i '/^pick /d' CMakeLists.txt`
 
-## PyTorch (Phase C, Step 10)
+## PyTorch Wheel Fixes (Phase C, Step 10)
 
-### 21. numpy>=2 ABI compatibility
+### 24. numpy>=2 ABI compatibility
 
 **Symptom**: Runtime `ImportError` or ABI mismatch when numpy 2.x is installed
 alongside a PyTorch wheel built against numpy 1.x headers.
@@ -285,7 +285,7 @@ ensures the wheel's compiled extensions are ABI-compatible with numpy 2.x
 at runtime. The old `numpy<2` downgrade guard in `install_rocm_requirements`
 is no longer needed and was removed.
 
-### 22. PyTorch .so patches not baked into wheel
+### 25. PyTorch .so patches not baked into wheel
 
 **Symptom**: PyTorch wheel installed on a different machine lacks RPATH fixes
 and `librocm_smi64.so` NEEDED entry, causing runtime `undefined symbol: rsmi_init`.
@@ -311,7 +311,7 @@ patchelf --add-needed librocm_smi64.so torch/lib/libtorch_hip.so
 # repack with zipfile
 ```
 
-### 22b. Build tree RPATH leak in libtorch_python.so
+### 25b. Build tree RPATH leak in libtorch_python.so
 
 **Symptom**: `import torch` fails with `undefined symbol: rsmi_init` pointing
 at `/opt/src/vllm/pytorch/build/lib/libtorch_hip.so` even though the installed
@@ -329,7 +329,7 @@ build tree references:
 patchelf --set-rpath '/opt/src/vllm/local/lib:$ORIGIN' torch/lib/libtorch_python.so
 ```
 
-### 22c. NumPy 2.0 ABI target version
+### 25c. NumPy 2.0 ABI target version
 
 **Symptom**: `import torch` crashes with "A module that was compiled using
 NumPy 1.x cannot be run in NumPy 2.4.3".
@@ -353,20 +353,30 @@ inside `numpyconfig.h` which is included by `arrayobject.h`.
 
 ## TorchVision (Phase C, Steps 12-13)
 
-### 23. TorchVision source build
+### 26. TorchVision source build
 
 **Non-issue**: TorchVision is now built from source (steps 12-13) against
 the source-built PyTorch to ensure ABI compatibility. Uses amdclang from
 TheRock. CPU-only (no CUDA/ROCm GPU ops -- TorchVision's GPU kernels are
 not needed for inference).
 
-## Triton (Phase D, Step 15)
+## Flash Attention (Phase F, Steps 26-28)
 
-Note: Triton steps renumbered from 12-14 to 14-16 due to TorchVision insertion.
+### 27. amdsmi import order (flash_attn)
+
+**Symptom**: Same as vLLM (#35 Patch 1) — amdsmi C extension crash when
+loaded after torch.
+
+**Root cause**: Identical to the vLLM fix. flash_attn's `__init__.py`
+imports torch before amdsmi, causing the same C extension initialization
+conflict.
+
+**Fix**: Prepend `import amdsmi` before any torch imports in
+`flash_attn/__init__.py`.
 
 ## Wheel Builds (Phase H)
 
-### 24. cmake pip wrapper in build isolation
+### 28. cmake pip wrapper in build isolation
 
 **Symptom**: sentencepiece source build fails with `ImportError: No module
 named 'cmake'`.
@@ -378,7 +388,7 @@ isolation, the cmake Python module isn't available, so the wrapper fails.
 **Fix**: Replace the Python wrapper with a symlink to the real system cmake
 binary (`/usr/bin/cmake`).
 
-### 25. meson -Werror vs -mllvm flags (numpy build)
+### 29. meson -Werror vs -mllvm flags (numpy build)
 
 **Symptom**: numpy build fails on meson capability probes.
 
@@ -392,7 +402,7 @@ CFLAGS for wheel builds. `-Xclang` passes flags directly to the compiler
 frontend/backend, bypassing the driver's argument tracking. Move `-famd-opt`
 to LDFLAGS (link-time only, no-op at compile time).
 
-### 26. Rust + amdclang linker
+### 30. Rust + amdclang linker
 
 **Symptom**: Cargo fails to link with "cc: error: unrecognized argument".
 
@@ -403,7 +413,7 @@ not prefixed by "amd". Cargo uses `cc` by default.
 Also unset CFLAGS/CXXFLAGS/LDFLAGS because they contain clang-specific
 flags that Rust's internal `cc` invocations don't understand.
 
-### 27. Rust -C target-cpu=native bug
+### 31. Rust -C target-cpu=native bug
 
 **Symptom**: Rust binary only uses SSE2 despite running on Zen 5.
 
@@ -414,14 +424,14 @@ enables SSE2 features (a known `rustc` bug).
 This enables all 40+ target features including AVX-512, VAES, VPCLMULQDQ,
 GFNI, SHA.
 
-### 28. pyzstd is now pure Python
+### 32. pyzstd is now pure Python
 
 **Non-issue**: pyzstd v0.19.1 restructured -- the C extension moved to a
 separate `backports-zstd` package. The main `pyzstd` package is now pure
 Python (`py3-none-any`). Since `zstandard` covers the same use case, pyzstd
 was removed from the build list.
 
-### 29. pyarrow requires full Arrow C++ build
+### 33. pyarrow requires full Arrow C++ build
 
 **Non-issue**: pyarrow's source build requires the entire Apache Arrow C++
 library pre-installed (30+ minute build with its own dependency tree). The
@@ -431,9 +441,22 @@ there's no meaningful gain from a source build.
 ## vLLM Runtime Patches (Phase E, Step 20b)
 
 These patches fix runtime issues specific to gfx1151 (RDNA 3.5, wave32).
-They are applied after cloning vLLM and before building.
+They are applied after cloning vLLM and before building. "Patch N" numbers
+in parentheses refer to the YAML `packages.vllm.patches[]` index.
 
-### 30. AITER gate extension to gfx1x (Patches 1-2)
+### 34. amdsmi import order (Patch 1)
+
+**Symptom**: `segfault` or `ImportError` on `import torch` when amdsmi is
+installed.
+
+**Root cause**: amdsmi's C extension conflicts with torch's ROCm
+initialization if loaded after torch. Both bind to the same ROCm SMI
+shared library but expect different initialization states.
+
+**Fix**: Prepend `import amdsmi` before any torch imports in vLLM's
+`__init__.py`. Identical to the flash_attn fix (#27).
+
+### 35. AITER gate extension to gfx1x (Patches 2-5)
 
 **Symptom**: AITER optimizations (attention, GEMM, normalization) are
 silently disabled on gfx1151 — only eager PyTorch paths are used.
@@ -446,7 +469,7 @@ silently disabled on gfx1151 — only eager PyTorch paths are used.
 `on_gfx1x()` alongside `on_gfx9()`. AITER has explicit gfx1151 tuning
 (chip_info.py enum 13, BLOCK_M/N=32, waves_per_eu=2).
 
-### 31. ViT attention revert to gfx9-only (Patch 3)
+### 36. ViT attention revert to gfx9-only (Patch 6)
 
 **Symptom**: Vision Transformer (ViT) encoder attention crashes with
 "invalid argument for fmha_fwd" on gfx1151.
@@ -460,7 +483,7 @@ encoder path cannot use CK attention.
 falls through to `TRITON_ATTN` which works correctly. If a previous build
 had extended the gate, this patch reverts it.
 
-### 32. FP8 linear disable on gfx1x (Patch 4)
+### 37. FP8 linear disable on gfx1x (Patch 7)
 
 **Symptom**: GPU page fault crash during FP8 quantized inference.
 
@@ -473,7 +496,7 @@ instructions, causing page faults.
 Returns `False` on RDNA 3.x, forcing vLLM to use its Triton blockscale
 GEMM fallback which generates correct gfx1151 kernels.
 
-### 33. AttrsDescriptor `__repr__` for Inductor codegen (Patch 5)
+### 38. AttrsDescriptor `__repr__` for Inductor codegen (Triton Patch 2, vLLM inline)
 
 **Symptom**: `SyntaxError` when loading torch.compile-generated Triton
 kernel files. torch.compile works on first run but fails on cache reload.
@@ -487,10 +510,13 @@ the generated file is re-imported.
 
 **Fix**: Add `__repr__` to `AttrsDescriptor` in
 `triton/backends/compiler.py` that produces valid, round-trippable Python
-via `from_dict()`. With this patch, `torch.compile` works correctly on
-gfx1151 — `--enforce-eager` is NOT required.
+via `from_dict()`. Applied in two places: (1) Triton source tree during
+`build_triton()` (YAML triton patch 2), and (2) the installed triton
+package during `patch_vllm_gfx1151()` to catch pre-built wheels. With this
+patch, `torch.compile` works correctly on gfx1151 — `--enforce-eager` is
+NOT required.
 
-### 34. Duplicate pattern registration crash (Patch 6)
+### 39. Duplicate pattern registration crash (Patch 9)
 
 **Symptom**: `RuntimeError: Duplicate pattern` during torch.compile
 initialization with AITER fusion passes enabled.
@@ -504,7 +530,7 @@ on duplicates.
 **Fix**: Add `skip_duplicates=True` to all `pm.register_replacement()`
 calls in the fusion pass.
 
-### 35. `+rms_norm` custom_ops block on gfx1x (Patch 7)
+### 40. `+rms_norm` custom_ops block on gfx1x (Patch 8)
 
 **Symptom**: Model produces garbage/incoherent output with AITER enabled
 and torch.compile active. Correct output in eager mode.
@@ -534,7 +560,7 @@ pass as a single HIPGraph) combined with ALL AITER optimizations
 (attention, GEMM, normalization). Previously, the `+rms_norm` bug forced
 PIECEWISE graph mode with AITER disabled.
 
-### 36. Triton sampler page fault on gfx1151 (Patch 8)
+### 41. Triton sampler page fault on gfx1151 (Patch 10)
 
 **Symptom**: GPU page fault during top-k/top-p sampling after torch.compile
 AOT compilation on RDNA 3.5.
@@ -550,7 +576,7 @@ architecture.
 (`topk` + `cumsum`) is functionally identical and works on all
 architectures.
 
-### 37. FLA chunk_delta_h autotuner + exp() type inference (Patch 9)
+### 42. FLA chunk_delta_h autotuner + exp() type inference (Patches 11-15)
 
 **Symptom**: Two issues in FLA (Flash Linear Attention) Triton kernels:
 1. Page faults during autotuning with `num_stages>2` or `BV=64`
@@ -568,7 +594,7 @@ generating invalid intermediate representation.
 - Cast `exp()` operands to `tl.float32` explicitly, which also improves
   precision
 
-### 38. Qwen3.5 FLA warmup page fault for T < BT (Patch 10)
+### 43. Qwen3.5 FLA warmup page fault for T < BT (Patch 16)
 
 **Symptom**: Page fault during Qwen3.5-next model warmup when FLA kernels
 are called with sequence lengths T=16 or T=32.
@@ -582,7 +608,7 @@ differently. The warmup loop iterates `T in (16, 32, 64)` but only T=64
 **Fix**: Restrict the warmup loop in `qwen3_next.py` to `for T in (64,)`
 only.
 
-### 39. flash_attn_2_cuda import on ROCm (Patch 11)
+### 44. flash_attn_2_cuda import on ROCm (Patch 17)
 
 **Symptom**: `ModuleNotFoundError: flash_attn_2_cuda` when loading rotary
 embedding with flash_attn installed.
@@ -598,7 +624,7 @@ for `ImportError`/`ModuleNotFoundError`. When the native extension is
 absent, the Triton-based rotary path is still available through other code
 paths.
 
-### 40. AITER RMSNorm CK dispatch on gfx1x (Patch 12)
+### 45. AITER RMSNorm CK dispatch on gfx1x (Patches 18-19)
 
 **Symptom**: Illegal instruction crash during quantized inference when AITER
 RMSNorm is active on gfx1151.
@@ -617,7 +643,7 @@ with the `use_model_sensitive_rmsnorm=0` kwarg.
 
 ## AITER Source Rebuild (Phase F, Step 28b)
 
-### 41. AITER CK ABI mismatch
+### 46. AITER CK ABI mismatch
 
 **Symptom**: JIT compilation of AITER MHA kernels fails with ABI
 mismatches -- struct field types, missing members, narrowing conversion
@@ -635,7 +661,7 @@ causing compilation failures.
 submodule. This ensures the compiled `.cu` interfaces and CK headers are
 from the same commit. The stale JIT cache is cleared before rebuild.
 
-### 42. AITER vec_convert.h CDNA-only packed ISA (gfx1151 header patch)
+### 47. AITER vec_convert.h CDNA-only packed ISA (gfx1151 header patch)
 
 **Symptom**: JIT compilation fails with "invalid instruction" for AITER
 kernels that use packed FP8 conversion on gfx1151.
@@ -653,7 +679,7 @@ execute.
 `CK_TILE_RDNA3_NO_PK_FP8` preprocessor guard. On RDNA 3/3.5
 (`__gfx11xx__`), scalar C++ equivalents are used instead of packed assembly.
 
-### 43. AITER hip_reduce.h DPP broadcast instructions (gfx1151 header patch)
+### 48. AITER hip_reduce.h DPP broadcast instructions (gfx1151 header patch)
 
 **Symptom**: Illegal instruction during warp reduction operations in AITER
 kernels on gfx1151.
@@ -671,3 +697,111 @@ rocprim's own `warp_reduce_dpp.hpp` RDNA path. The `WarpSize > 32` path
 uses a `static_assert` since RDNA is wave32-only (CDNA is wave64). Patches
 target installed site-packages headers (not source tree) because AITER's
 JIT reads from the venv.
+
+### 49. FLA chunk_o autotuner page fault on AMD HIP (Patches 20-23)
+
+**Symptom**: GPU page fault during Triton autotuning of the
+`chunk_fwd_kernel_o` kernel in the FLA (Flash Linear Attention) ops for
+Qwen3.5 GDN (Gated Delta Network) layers.
+
+**Root cause**: Same class of issue as chunk_delta_h (#37). The autotune
+search space includes BK/BV=64/128 and pipeline depths num_stages=3,4 that
+exceed RDNA 3.5's register pressure limits. The kernel page-faults during
+autotuning with the larger tile configurations.
+
+**Fix**: Four sed patches to `chunk_o.py`:
+1. Add `is_amd` to the utils import
+2. Restrict BK to `[32]` on AMD (vs `BKV_LIST = [64, 128]`)
+3. Restrict BV to `[32]` on AMD
+4. Restrict num_stages to `[2]` on AMD (vs `[2, 3, 4]`)
+
+### 50. KV cache page size mismatch: ROCm block_size vs hybrid alignment (Patches 24-25)
+
+**Symptom**: Qwen3.5 GDN (hybrid mamba+attention model) fails with
+assertion errors or incorrect generation due to block_size mismatch between
+AITER's requirement and the hybrid model's mamba state alignment.
+
+**Root cause**: The vLLM configuration pipeline has a sequencing issue:
+1. `HybridAttentionMambaModelConfig.verify_and_update_config()` computes
+   `attn_block_size` as lcm(mamba_state, kernel_alignment=32), producing
+   e.g. 576 for Qwen3.5
+2. `current_platform.check_and_update_config()` runs AFTER and sets
+   `block_size=64` (ROCm AITER's requirement), clobbering step 1
+3. The mamba layers now get a block_size (64) that doesn't satisfy their
+   state alignment requirement
+
+**Fix**: Two patches:
+- **Patch 24** (`config/vllm.py`): Re-run
+  `HybridAttentionMambaModelConfig.verify_and_update_config()` after the
+  platform config, so the hybrid alignment is recomputed with the
+  platform's block_size as a constraint
+- **Patch 25** (`models/config.py`): Use
+  `max(kernel_block_alignment_size, cache_config.block_size)` as the kernel
+  alignment. If the platform already set block_size=64, the computed
+  attn_block_size will be a multiple of both 64 (AITER) and the mamba state
+  size
+
+### 51. AITER unified attention Triton kernel crash on non-power-of-2 block_size (Patches 26-28) [TESTING]
+
+**Status**: TESTING — routing hybrid models away from AITER attention
+entirely (Patch 26) may be too aggressive. An alternative approach would be
+to fix the AITER kernel to decouple TILE_SIZE from block_size, similar to
+how `TritonAttentionBackend` handles it. Patches 27-28 are
+defense-in-depth and may be sufficient on their own.
+
+**Symptom**: `OutOfResources: shared memory, Required: 1081344, Hardware
+limit: 65536` crash when AITER unified attention is used with hybrid models
+that produce non-power-of-2 block_size (e.g. 576).
+
+**Root cause**: AITER's unified attention Triton kernel uses
+`TILE_SIZE = block_size` directly in `tl.arange()`, which requires N to be
+a power of 2. After fix #50, block_size=576 (not power of 2).
+`next_power_of_2(576) = 1024`, and the resulting shared memory allocation
+(1024 * head_size * elem_size per K/V tile) exceeds the 64 KiB LDS on all
+AMD GPUs.
+
+**Fix**: Three-layer defense-in-depth:
+- **Patch 26** (`rocm.py`) [TESTING]: Detect hybrid models via
+  `model_config.is_hybrid` and skip AITER unified attention and AITER FA
+  backends entirely. Hybrid models fall through to `TRITON_ATTN`, which
+  decouples tile size from block size
+- **Patch 27** (`rocm_aiter_unified_attn.py`) [TESTING]: Add power-of-2
+  constraint to `supports_block_size()`. The original check only validated
+  `block_size % 16 == 0`; now also requires
+  `(block_size & (block_size - 1)) == 0`
+- **Patch 28** (AITER `unified_attention.py`) [TESTING]: Cap
+  `TILE_SIZE = min(block_size, 128)` in both `select_2d_config` and
+  `select_3d_config`. For standard block sizes (64/128) this is a no-op.
+  For abnormal block sizes that somehow reach the kernel, the cap prevents
+  the LDS overflow
+
+## Runtime Environment Files (Phase I)
+
+The build generates `.env` files for llama.cpp backends used by Lemonade.
+These are generated from `vllm-packages.yaml` via the `generate_env_file()`
+helper — the YAML `packages.llamacpp.backends.{rocm,vulkan}.env` maps are
+the single source of truth.
+
+### ROCm backend `.env`
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `HSA_OVERRIDE_GFX_VERSION` | `11.5.1` | Override for ROCm runtime gfx1151 detection |
+| `ROCBLAS_USE_HIPBLASLT` | `1` | Use hipBLASLt for GEMM (faster on gfx1151) |
+| `THP` | `always` | Transparent Huge Pages for unified memory |
+| `LLAMA_ARG_BATCH` | `2048` | +33% prefill throughput over default (512) |
+| `LLAMA_ARG_UBATCH` | `2048` | Micro-batch size matching batch size |
+
+**Note**: Q8 KV cache (`LLAMA_ARG_CACHE_TYPE_K/V=q8_0`) is omitted from
+the generated `.env`. It halves KV bandwidth on unified memory but causes
+context creation failures on some small models (e.g. Qwen2.5 0.5B FP16).
+Enable per-model during benchmarks.
+
+### Vulkan backend `.env`
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `LLAMA_ARG_BATCH` | `2048` | Batch size optimization |
+| `LLAMA_ARG_UBATCH` | `2048` | Micro-batch size matching batch size |
+
+No HSA/ROCm variables needed — Vulkan uses its own driver stack.

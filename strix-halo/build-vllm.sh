@@ -9,6 +9,7 @@
 #
 #   TheRock ROCm → AOCL-LibM → Python → PyTorch → Triton → AOTriton → vLLM → Flash Attention
 #   + Optimized wheels for performance-critical Python packages
+#   + Lemonade (unified inference server: llama.cpp GPU/CPU + FLM NPU + ONNX)
 #
 # Every component is compiled with: -march=native -O3 -flto=thin
 # Rust packages use: -C target-cpu=znver5 (full AVX-512 + VAES)
@@ -28,7 +29,7 @@
 #   scripts/build-vllm.sh --rebuild   # Force rebuild (clean + build)
 #   scripts/build-vllm.sh --step N    # Run from step N onward
 #
-# Build pipeline (30 steps):
+# Build pipeline (35 steps):
 #   Phase A: ROCm SDK (TheRock — builds amdclang used by everything downstream)
 #     1. Clone TheRock          3. Build TheRock
 #     2. Configure TheRock      4. Validate ROCm
@@ -68,6 +69,11 @@
 #    30. Build Rust wheels      (orjson, cryptography — AVX-512 + VAES)
 #    31. Build C/C++ wheels     (numpy, sentencepiece, zstandard, asyncpg)
 #    32. Export source wheels    (torch, triton, torchvision, amd-aiter, amdsmi)
+#
+#   Phase I: Lemonade Inference Server (llama.cpp + FLM + ONNX)
+#    33. Clone Lemonade + build llama.cpp with hipBLAS for gfx1151
+#    34. Install Lemonade SDK from PyPI (lemonade-sdk)
+#    35. Validate Lemonade (server smoke test)
 
 set -euo pipefail
 
@@ -84,52 +90,72 @@ source "${_SCRIPT_DIR}/common.sh"
 
 unset _SCRIPT_REAL_PATH
 
+# =============================================================================
+# YAML Manifest Helpers
+# =============================================================================
+# The package manifest (vllm-packages.yaml) is the single source of truth for
+# repos, branches, source directories, prerequisites, and step ordering.
+
+MANIFEST="${_SCRIPT_DIR}/vllm-packages.yaml"
+if [[ ! -f "${MANIFEST}" ]]; then
+    echo "FATAL: ${MANIFEST} not found" >&2
+    exit 1
+fi
+
+# Read a value from the YAML manifest. Returns empty string if path doesn't exist.
+# Uses // "" (mikefarah/yq v4 alternative operator) to return empty on null/missing.
+# Usage: ycfg ".build.vllm_dir"  or  ycfg ".packages.pytorch.repo"
+ycfg() {
+    yq -r "$1 // \"\"" "${MANIFEST}"
+}
+
+# Read a package field.  Usage: pkg pytorch repo  →  https://github.com/ROCm/pytorch.git
+pkg() {
+    ycfg ".packages.$1.$2"
+}
+
+# =============================================================================
+# Configuration from Manifest
+# =============================================================================
+
 # Source the vLLM environment (compiler flags, paths).
 # shellcheck source=vllm-env.sh
 source "${_SCRIPT_DIR}/vllm-env.sh"
 
-TOTAL_STEPS=32
+# Re-source vllm-env.sh to restore compiler flags after steps that unset them
+# (e.g., Python build unsets CFLAGS/LDFLAGS to avoid -lalm contamination,
+# TheRock cmake unsets them to avoid env var interference).
+_vllm_source_env() {
+    # shellcheck source=vllm-env.sh
+    source "${_SCRIPT_DIR}/vllm-env.sh"
+}
 
-# CPython version to build
-CPYTHON_VERSION="3.13.12"
+TOTAL_STEPS="$(ycfg '.build.total_steps')"
+CPYTHON_VERSION="$(ycfg '.build.cpython_version')"
 CPYTHON_TAG="v${CPYTHON_VERSION}"
 
-# Source repository URLs
-# PyTorch: ROCm fork carries AMD-specific fixes (hipify, Tensile, rocm_smi linkage)
-# that haven't been upstreamed. The upstream pytorch/pytorch works with USE_ROCM=1
-# but the ROCm fork is what AMD's CI tests against.
-THEROCK_REPO="https://github.com/ROCm/TheRock.git"
-PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
-PYTORCH_BRANCH="develop"
-TRITON_REPO="https://github.com/ROCm/triton.git"
-TRITON_BRANCH="main_perf"
-AOTRITON_REPO="https://github.com/ROCm/aotriton.git"
-VLLM_REPO="https://github.com/vllm-project/vllm.git"
-TORCHVISION_REPO="https://github.com/pytorch/vision.git"
-FLASH_ATTN_REPO="https://github.com/ROCm/flash-attention.git"
-
-# AOCL (AMD Optimizing CPU Libraries)
-AOCL_UTILS_REPO="https://github.com/amd/aocl-utils.git"
-AOCL_LIBM_REPO="https://github.com/amd/aocl-libm-ose.git"
-
 # Unified install prefix — all C/C++ libraries install here.
-# This gives us one -L path, one LD_LIBRARY_PATH entry, one CMAKE_PREFIX_PATH.
-# Layout mirrors /usr/local/: bin/, lib/, include/, share/, lib/llvm/
 LOCAL_PREFIX="${VLLM_DIR}/local"
 
-# Source directories under /opt/src/vllm/
-AOCL_UTILS_SRC="${VLLM_DIR}/aocl-utils"
-AOCL_LIBM_SRC="${VLLM_DIR}/aocl-libm"
-CPYTHON_SRC="${VLLM_DIR}/cpython"
-THEROCK_SRC="${VLLM_DIR}/therock"
-PYTORCH_SRC="${VLLM_DIR}/pytorch"
-TRITON_SRC="${VLLM_DIR}/triton"
-AOTRITON_SRC="${VLLM_DIR}/aotriton"
-TORCHVISION_SRC="${VLLM_DIR}/torchvision"
-FLASH_ATTN_SRC="${VLLM_DIR}/flash-attention"
+# Source directories — derived from YAML src_dir fields
+THEROCK_SRC="${VLLM_DIR}/$(pkg therock src_dir)"
+AOCL_UTILS_SRC="${VLLM_DIR}/$(pkg aocl_utils src_dir)"
+AOCL_LIBM_SRC="${VLLM_DIR}/$(pkg aocl_libm src_dir)"
+CPYTHON_SRC="${VLLM_DIR}/$(pkg cpython src_dir)"
+PYTORCH_SRC="${VLLM_DIR}/$(pkg pytorch src_dir)"
+TRITON_SRC="${VLLM_DIR}/$(pkg triton src_dir)"
+AOTRITON_SRC="${VLLM_DIR}/$(pkg aotriton src_dir)"
+TORCHVISION_SRC="${VLLM_DIR}/$(pkg torchvision src_dir)"
+FLASH_ATTN_SRC="${VLLM_DIR}/$(pkg flash_attention src_dir)"
+LEMONADE_SRC="${VLLM_DIR}/$(pkg lemonade src_dir)"
+LLAMACPP_SRC="${VLLM_DIR}/$(pkg llamacpp src_dir)"
 
-# Wheel output directory — all pip-installable wheels stored here.
-# Downstream projects install from this directory.
+# Lemonade backend install directories
+LLAMACPP_ROCM_DIR="${VLLM_VENV}/rocm/llama_server"
+LLAMACPP_VULKAN_DIR="${VLLM_VENV}/vulkan/llama_server"
+LLAMACPP_INSTALL_DIR="${LLAMACPP_ROCM_DIR}"
+
+# Wheel output directory
 WHEELS_DIR="${VLLM_DIR}/wheels"
 
 # =============================================================================
@@ -198,58 +224,513 @@ newest_wheel() {
 
 check_prerequisites() {
     section "Checking prerequisites"
-    require_commands clang clang++ lld cmake ninja uv git curl python3
 
-    # TheRock build dependencies (system packages)
+    # Read required commands from manifest
+    local required_cmds
+    mapfile -t required_cmds < <(ycfg '.prerequisites.required_commands[]')
+    require_commands "${required_cmds[@]}"
+
+    # Check build tools from manifest
+    local build_tools
+    mapfile -t build_tools < <(ycfg '.prerequisites.build_tools[]')
     local missing_pkgs=()
-    for cmd in gfortran patchelf automake libtool bison flex xxd scons; do
+    for cmd in "${build_tools[@]}"; do
         if ! command -v "${cmd}" &>/dev/null; then
             missing_pkgs+=("${cmd}")
         fi
     done
     if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
-        die "Missing system packages required for build: ${missing_pkgs[*]}. Install with your package manager."
+        die "Missing system packages: ${missing_pkgs[*]}. Install with:\n  $(ycfg '.prerequisites.install_command')"
     fi
     success "System build tools present"
 
-    # Verify clang version >= 21
+    # Verify clang version from manifest
+    local clang_min
+    clang_min="$(ycfg '.build.clang_min_version')"
     local clang_version
     clang_version="$(clang --version | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1)"
     local clang_major
     clang_major="${clang_version%%.*}"
-    if [[ "${clang_major}" -lt 21 ]]; then
-        die "Clang ${clang_version} found, but >= 21 is required."
+    if [[ "${clang_major}" -lt "${clang_min}" ]]; then
+        die "Clang ${clang_version} found, but >= ${clang_min} is required."
     fi
-    success "Clang ${clang_version} (>= 21)"
+    success "Clang ${clang_version} (>= ${clang_min})"
 
     # Verify cmake version >= 3.25
     local cmake_version
     cmake_version="$(cmake --version | head -1 | grep -oP '\d+\.\d+' | head -1)"
     success "CMake ${cmake_version}"
 
-    # Verify GPU is accessible
-    if [[ ! -e /dev/kfd ]]; then
-        die "/dev/kfd not found. Is amdgpu loaded?"
-    fi
-    success "GPU accessible (/dev/kfd)"
+    # Check required device nodes from manifest
+    local device_nodes
+    mapfile -t device_nodes < <(ycfg '.prerequisites.device_nodes[]')
+    for node in "${device_nodes[@]}"; do
+        if [[ ! -e "${node}" ]]; then
+            die "${node} not found. Are kernel modules loaded? Required: $(ycfg '.platform.kernel_modules | join(", ")')"
+        fi
+        success "Device node ${node} present"
+    done
 
-    # Verify kernel
+    # Verify kernel version
+    local kernel_min
+    kernel_min="$(ycfg '.platform.kernel_min')"
     local kernel_ver
     kernel_ver="$(uname -r)"
-    if [[ ! "${kernel_ver}" =~ ^7\. ]]; then
-        warn "Kernel ${kernel_ver} detected. Kernel 7.0+ recommended."
+    local kernel_major
+    kernel_major="${kernel_ver%%.*}"
+    if [[ "${kernel_major}" -lt "${kernel_min%%.*}" ]]; then
+        warn "Kernel ${kernel_ver} detected. Kernel ${kernel_min}+ recommended."
+        warn "Install with: sudo pacman -S $(ycfg '.prerequisites.kernel_package')"
     else
         success "Kernel ${kernel_ver}"
     fi
 
-    # Check available disk space (need ~100GB)
+    # Check available disk space from manifest
+    local disk_required
+    disk_required="$(ycfg '.build.disk_required_gb')"
     local avail_gb
-    avail_gb="$(df -BG /opt/src/ 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G')"
-    if [[ -n "${avail_gb}" && "${avail_gb}" -lt 100 ]]; then
-        warn "Only ${avail_gb}GB available. Build requires ~100GB."
+    avail_gb="$(df -BG "${VLLM_DIR}" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G')"
+    if [[ -n "${avail_gb}" && "${avail_gb}" -lt "${disk_required}" ]]; then
+        warn "Only ${avail_gb}GB available. Build requires ~${disk_required}GB."
     else
         success "Disk space: ${avail_gb:-unknown}GB available"
     fi
+}
+
+# =============================================================================
+# Generic Clone
+# =============================================================================
+# Single clone function that replaces 7+ nearly-identical clone_* functions.
+# Reads repo, branch, recursive, shallow, validate_remote, and clean_generated
+# from the YAML manifest per package.
+#
+# Usage: clone_pkg <yaml_key> <src_dir> [description]
+#   yaml_key:     Package key in the YAML manifest (e.g., "pytorch", "triton")
+#   src_dir:      Absolute path to the source directory
+#   description:  Human-readable label for log output (optional, defaults to yaml_key)
+#
+# The caller is responsible for log_step() — clone_pkg does not log step headers.
+# This allows it to be called both from the YAML dispatch loop (which logs the
+# step header) and from within build functions (which have their own log_step).
+
+clone_pkg() {
+    local yaml_key="$1"
+    local src_dir="$2"
+    local description="${3:-${yaml_key}}"
+
+    local repo branch is_recursive is_shallow validate_remote clean_generated
+
+    repo="$(pkg "${yaml_key}" repo)"
+    branch="$(pkg "${yaml_key}" branch)"
+    is_recursive="$(pkg "${yaml_key}" recursive)"
+    is_shallow="$(pkg "${yaml_key}" shallow)"
+    validate_remote="$(pkg "${yaml_key}" validate_remote)"
+    clean_generated="$(pkg "${yaml_key}" clean_generated)"
+
+    if [[ -d "${src_dir}/.git" ]]; then
+        info "${description} already cloned at ${src_dir}"
+        cd "${src_dir}"
+
+        # Validate remote URL if required (e.g., ensure ROCm fork, not upstream)
+        if [[ -n "${validate_remote}" ]]; then
+            local current_url
+            current_url="$(git remote get-url origin 2>/dev/null)"
+            if [[ "${current_url}" != *"${validate_remote}"* ]]; then
+                info "Switching remote from ${current_url} to ${repo}"
+                git remote set-url origin "${repo}"
+            fi
+        fi
+
+        # Clean generated files before branch operations (e.g., PyTorch's
+        # hipify step modifies hundreds of files in-tree)
+        if [[ "${clean_generated}" == "true" ]]; then
+            local dirty_count
+            dirty_count="$(git status --short | wc -l)"
+            if [[ "${dirty_count}" -gt 0 ]]; then
+                info "Resetting ${dirty_count} generated files in ${description} tree..."
+                git checkout -- .
+                git submodule foreach --recursive 'git checkout -- . 2>/dev/null || true'
+            fi
+        fi
+
+        # Fetch and update
+        local pull_branch="${branch:-$(git branch --show-current)}"
+        git fetch origin "${pull_branch}"
+
+        # Switch branches if needed
+        local current_branch
+        current_branch="$(git branch --show-current)"
+        if [[ -n "${branch}" && "${current_branch}" != "${branch}" ]]; then
+            info "Switching to ${branch} branch..."
+            git checkout "${branch}"
+        fi
+        git pull origin "${pull_branch}"
+
+        # Update submodules if recursive
+        if [[ "${is_recursive}" == "true" ]]; then
+            info "Updating submodules..."
+            git submodule update --init --recursive
+        fi
+
+        cd "${VLLM_DIR}"
+        success "${description} source updated"
+        return
+    fi
+
+    # Fresh clone
+    local clone_args=()
+    if [[ "${is_recursive}" == "true" ]]; then
+        clone_args+=(--recurse-submodules)
+    fi
+    if [[ -n "${branch}" ]]; then
+        clone_args+=(--branch "${branch}")
+    fi
+    if [[ "${is_shallow}" == "true" ]]; then
+        clone_args+=(--depth 1)
+    fi
+
+    info "Cloning ${description}..."
+    git clone "${clone_args[@]}" "${repo}" "${src_dir}"
+    success "${description} cloned to ${src_dir}"
+}
+
+# =============================================================================
+# Generic Patch Application
+# =============================================================================
+# Reads patches from the YAML manifest and applies them. Handles types:
+#   sed            - In-place sed with marker-based idempotency
+#   file_copy      - Copy file or directory with optional chmod
+#   patchelf_rpath - Set or add ELF RPATH via patchelf
+#   patchelf_needed - Add NEEDED library to ELF via patchelf
+#
+# Types 'file_rewrite' and 'prepend' are skipped — their content is embedded
+# in build functions as heredocs or Python scripts (too complex for YAML).
+#
+# Usage: apply_patches <pkg_key> <src_dir>
+
+apply_patches() {
+    local pkg_key="$1"
+    local src_dir="$2"
+
+    local patch_count
+    patch_count="$(ycfg ".packages.${pkg_key}.patches | length")"
+    if [[ "${patch_count}" == "0" || -z "${patch_count}" ]]; then
+        return
+    fi
+
+    info "Applying ${patch_count} patches for ${pkg_key}..."
+
+    local i
+    for i in $(seq 0 $(( patch_count - 1 ))); do
+        local p_type p_file p_marker p_marker_absent p_marker_present p_description
+        p_type="$(ycfg ".packages.${pkg_key}.patches[${i}].type")"
+        p_description="$(ycfg ".packages.${pkg_key}.patches[${i}].description")"
+
+        case "${p_type}" in
+            sed)
+                p_file="$(ycfg ".packages.${pkg_key}.patches[${i}].file")"
+                p_marker="$(ycfg ".packages.${pkg_key}.patches[${i}].marker")"
+                p_marker_absent="$(ycfg ".packages.${pkg_key}.patches[${i}].marker_absent")"
+                p_marker_present="$(ycfg ".packages.${pkg_key}.patches[${i}].marker_present")"
+                local p_sed_command
+                p_sed_command="$(ycfg ".packages.${pkg_key}.patches[${i}].sed_command")"
+
+                local target_file="${src_dir}/${p_file}"
+                if [[ ! -f "${target_file}" ]]; then
+                    info "  [${i}] ${p_file}: not found, skipping"
+                    continue
+                fi
+
+                # Determine if patch is needed based on marker logic
+                local needs_patch=false
+                if [[ "${p_marker_absent}" == "true" ]]; then
+                    # Patch needed if marker is ABSENT from file
+                    if ! grep -q "${p_marker}" "${target_file}" 2>/dev/null; then
+                        needs_patch=true
+                    fi
+                elif [[ "${p_marker_present}" == "true" ]]; then
+                    # Patch needed if marker IS PRESENT (explicit revert patches)
+                    if grep -q "${p_marker}" "${target_file}" 2>/dev/null; then
+                        needs_patch=true
+                    fi
+                else
+                    # Default: patch needed if marker is PRESENT (marker is the thing being replaced)
+                    if grep -q "${p_marker}" "${target_file}" 2>/dev/null; then
+                        needs_patch=true
+                    fi
+                fi
+
+                if [[ "${needs_patch}" == "true" ]]; then
+                    info "  [${i}] ${p_file}: ${p_description}"
+                    sed -i "${p_sed_command}" "${target_file}"
+                else
+                    info "  [${i}] ${p_file}: already applied"
+                fi
+                ;;
+
+            file_copy)
+                local p_src p_dst p_recursive p_mode
+                p_src="$(ycfg ".packages.${pkg_key}.patches[${i}].src")"
+                p_dst="$(ycfg ".packages.${pkg_key}.patches[${i}].dst")"
+                p_recursive="$(ycfg ".packages.${pkg_key}.patches[${i}].recursive")"
+                p_mode="$(ycfg ".packages.${pkg_key}.patches[${i}].mode")"
+
+                # Expand shell variables in paths (src/dst may contain ${VAR})
+                p_src="$(eval echo "${p_src}")"
+                p_dst="$(eval echo "${p_dst}")"
+
+                if [[ -e "${p_dst}" ]]; then
+                    info "  [${i}] $(basename "${p_dst}"): already exists"
+                else
+                    if [[ ! -e "${p_src}" ]]; then
+                        warn "  [${i}] Source not found: ${p_src}"
+                        continue
+                    fi
+                    info "  [${i}] ${p_description}"
+                    if [[ "${p_recursive}" == "true" ]]; then
+                        cp -a "${p_src}" "${p_dst}"
+                    else
+                        cp "${p_src}" "${p_dst}"
+                    fi
+                    if [[ -n "${p_mode}" ]]; then
+                        chmod "${p_mode}" "${p_dst}"
+                    fi
+                fi
+                ;;
+
+            patchelf_rpath)
+                local p_target p_rpath p_action
+                p_target="$(ycfg ".packages.${pkg_key}.patches[${i}].target")"
+                p_rpath="$(ycfg ".packages.${pkg_key}.patches[${i}].rpath")"
+                p_action="$(ycfg ".packages.${pkg_key}.patches[${i}].action")"
+
+                # Expand shell variables
+                p_target="$(eval echo "${p_target}")"
+                p_rpath="$(eval echo "${p_rpath}")"
+
+                info "  [${i}] ${p_description}"
+                local _so
+                for _so in ${p_target}; do
+                    [[ -f "${_so}" ]] || continue
+                    if [[ "${p_action}" == "set" ]]; then
+                        patchelf --set-rpath "${p_rpath}" "${_so}" 2>/dev/null || true
+                    elif [[ "${p_action}" == "add" ]]; then
+                        patchelf --add-rpath "${p_rpath}" "${_so}" 2>/dev/null || true
+                    fi
+                done
+                ;;
+
+            patchelf_needed)
+                local p_target p_library
+                p_target="$(ycfg ".packages.${pkg_key}.patches[${i}].target")"
+                p_library="$(ycfg ".packages.${pkg_key}.patches[${i}].library")"
+
+                p_target="$(eval echo "${p_target}")"
+
+                if [[ -f "${p_target}" ]] && ! readelf -d "${p_target}" 2>/dev/null | grep -q "${p_library}"; then
+                    info "  [${i}] ${p_description}"
+                    patchelf --add-needed "${p_library}" "${p_target}"
+                else
+                    info "  [${i}] $(basename "${p_target}"): ${p_library} already in NEEDED"
+                fi
+                ;;
+
+            file_rewrite|prepend)
+                # Content is in build-vllm.sh heredocs/Python scripts — too complex for YAML.
+                # Build functions handle these directly; this entry exists for documentation.
+                ;;
+
+            *)
+                warn "  [${i}] Unknown patch type: ${p_type}"
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# Generic Skip-If-Built Check
+# =============================================================================
+# Reads skip_check from YAML and returns 0 (should skip) or 1 (should build).
+# Supports types:
+#   file_exists  - Check for a file relative to LOCAL_PREFIX
+#   import       - Python import check (runs from VLLM_DIR to avoid local dirs)
+#   wheel        - Check for wheel glob in WHEELS_DIR
+#
+# Usage: if should_skip_step <pkg_key>; then return; fi
+
+should_skip_step() {
+    local pkg_key="$1"
+
+    local check_type
+    check_type="$(ycfg ".packages.${pkg_key}.skip_check.type")"
+    [[ -n "${check_type}" ]] || return 1
+
+    case "${check_type}" in
+        file_exists)
+            local check_path
+            check_path="$(ycfg ".packages.${pkg_key}.skip_check.path")"
+            if [[ -f "${LOCAL_PREFIX}/${check_path}" ]]; then
+                info "${pkg_key} already built (${check_path} exists)"
+                return 0
+            fi
+            ;;
+
+        import)
+            local check_cmd check_workdir
+            check_cmd="$(ycfg ".packages.${pkg_key}.skip_check.command")"
+            check_workdir="$(ycfg ".packages.${pkg_key}.skip_check.workdir")"
+            check_workdir="${check_workdir:-${VLLM_DIR}}"
+            check_workdir="$(eval echo "${check_workdir}")"
+            if (cd "${check_workdir}" && python -c "${check_cmd}") 2>/dev/null; then
+                local ver
+                ver="$(cd "${check_workdir}" && python -c "${check_cmd}" 2>/dev/null || true)"
+                info "${pkg_key} already built and importable${ver:+ (${ver})}"
+                return 0
+            fi
+            ;;
+
+        wheel)
+            local check_pattern
+            check_pattern="$(ycfg ".packages.${pkg_key}.skip_check.pattern")"
+            if compgen -G "${WHEELS_DIR}/${check_pattern}" >/dev/null 2>&1; then
+                local check_import
+                check_import="$(ycfg ".packages.${pkg_key}.skip_check.import_cmd")"
+                if [[ -n "${check_import}" ]]; then
+                    local ver
+                    ver="$(python -c "${check_import}" 2>/dev/null || true)"
+                    if [[ -n "${ver}" ]]; then
+                        info "${pkg_key} already built (wheel exists, version ${ver})"
+                        return 0
+                    fi
+                else
+                    info "${pkg_key} already built (wheel exists)"
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+# =============================================================================
+# Generic Validation
+# =============================================================================
+# Runs validation commands from the YAML manifest's validation: array.
+# Each command is a shell expression evaluated with eval (supports ${VAR}).
+#
+# Usage: validate_pkg <pkg_key>
+
+validate_pkg() {
+    local pkg_key="$1"
+
+    local val_count
+    val_count="$(ycfg ".packages.${pkg_key}.validation | length")"
+    if [[ "${val_count}" == "0" || -z "${val_count}" ]]; then
+        return
+    fi
+
+    local i
+    for i in $(seq 0 $(( val_count - 1 ))); do
+        local cmd
+        cmd="$(ycfg ".packages.${pkg_key}.validation[${i}]")"
+        [[ -n "${cmd}" ]] || continue
+
+        # Expand shell variables in the command
+        local expanded_cmd
+        expanded_cmd="$(eval echo "${cmd}")"
+
+        if eval "${expanded_cmd}" >/dev/null 2>&1; then
+            success "  ${cmd}"
+        else
+            warn "  FAILED: ${cmd}"
+        fi
+    done
+}
+
+# =============================================================================
+# Generic Build Dependencies Installer
+# =============================================================================
+# Reads build_dependencies from YAML and installs via uv pip install.
+#
+# Usage: install_pkg_deps <pkg_key>
+
+install_pkg_deps() {
+    local pkg_key="$1"
+
+    local dep_count
+    dep_count="$(ycfg ".packages.${pkg_key}.build_dependencies | length")"
+    if [[ "${dep_count}" == "0" || -z "${dep_count}" ]]; then
+        return
+    fi
+
+    local deps
+    mapfile -t deps < <(ycfg ".packages.${pkg_key}.build_dependencies[]")
+
+    if [[ ${#deps[@]} -gt 0 ]]; then
+        info "Installing ${#deps[@]} build dependencies for ${pkg_key}..."
+        uv pip install "${deps[@]}"
+    fi
+}
+
+# =============================================================================
+# Generic Build Environment Setup
+# =============================================================================
+# Reads environment: map from YAML and exports each key=value pair.
+# Values support ${VAR} expansion (e.g., HIP_PATH: "${ROCM_PATH}").
+#
+# Usage: setup_build_env <pkg_key>
+
+setup_build_env() {
+    local pkg_key="$1"
+
+    local env_keys
+    mapfile -t env_keys < <(ycfg ".packages.${pkg_key}.environment | keys | .[]" 2>/dev/null || true)
+
+    local key
+    for key in "${env_keys[@]}"; do
+        [[ -n "${key}" ]] || continue
+        local val
+        val="$(ycfg ".packages.${pkg_key}.environment.${key}")"
+        # Expand shell variables in value
+        val="$(eval echo "${val}")"
+        export "${key}=${val}"
+    done
+}
+
+# =============================================================================
+# Generic .env File Generation
+# =============================================================================
+# Reads env: map from a YAML path and writes key=value pairs to a .env file.
+# Includes a header comment and preserves comment lines from the source.
+#
+# Usage: generate_env_file <yaml_path> <output_path> <header_comment>
+
+generate_env_file() {
+    local yaml_path="$1"
+    local output_path="$2"
+    local header_comment="$3"
+
+    local env_keys
+    mapfile -t env_keys < <(ycfg "${yaml_path} | keys | .[]" 2>/dev/null || true)
+    if [[ ${#env_keys[@]} -eq 0 ]]; then
+        warn "No env keys found at ${yaml_path}"
+        return
+    fi
+
+    {
+        echo "# ${header_comment}"
+        echo "# Generated from vllm-packages.yaml"
+        local key
+        for key in "${env_keys[@]}"; do
+            [[ -n "${key}" ]] || continue
+            local val
+            val="$(ycfg "${yaml_path}.${key}")"
+            echo "${key}=${val}"
+        done
+    } > "${output_path}"
+
+    info "Wrote .env to ${output_path}"
 }
 
 # =============================================================================
@@ -261,14 +742,10 @@ check_prerequisites() {
 build_aocl_utils() {
     log_step 5 "Build AOCL-Utils (CPU feature detection for Zen 5)"
 
-    if [[ -f "${LOCAL_PREFIX}/lib/libaoclutils.so" ]]; then
-        info "AOCL-Utils already built at ${LOCAL_PREFIX}"
-        return
-    fi
+    if should_skip_step aocl_utils; then return; fi
 
     if [[ ! -d "${AOCL_UTILS_SRC}/.git" ]]; then
-        info "Cloning AOCL-Utils..."
-        git clone "${AOCL_UTILS_REPO}" "${AOCL_UTILS_SRC}"
+        clone_pkg aocl_utils "${AOCL_UTILS_SRC}" "AOCL-Utils"
     fi
 
     cd "${AOCL_UTILS_SRC}"
@@ -317,14 +794,10 @@ build_aocl_utils() {
 build_aocl_libm() {
     log_step 6 "Build AOCL-LibM (Zen 5 optimized transcendentals)"
 
-    if [[ -f "${LOCAL_PREFIX}/lib/libalm.so" ]]; then
-        info "AOCL-LibM already built at ${LOCAL_PREFIX}"
-        return
-    fi
+    if should_skip_step aocl_libm; then return; fi
 
     if [[ ! -d "${AOCL_LIBM_SRC}/.git" ]]; then
-        info "Cloning AOCL-LibM..."
-        git clone "${AOCL_LIBM_REPO}" "${AOCL_LIBM_SRC}"
+        clone_pkg aocl_libm "${AOCL_LIBM_SRC}" "AOCL-LibM"
     fi
 
     cd "${AOCL_LIBM_SRC}"
@@ -339,38 +812,8 @@ build_aocl_libm() {
         die "amdclang not found at ${amdclang} — run TheRock build first (steps 1-4)"
     fi
 
-    # Patch out -muse-unaligned-vector-move flag.
-    # AOCL-LibM's SConscript assumes any clang >= 14.0.6 is AOCC (AMD's
-    # proprietary compiler) and injects this AOCC-only flag. TheRock's
-    # open-source amdclang doesn't support it — neither does upstream clang.
-    # The flag enables unaligned vector load codegen; amdclang's -famd-opt
-    # covers equivalent optimizations.
-    local sconscript="${AOCL_LIBM_SRC}/src/SConscript"
-    if [[ -f "${sconscript}" ]] && grep -q 'muse-unaligned-vector-move' "${sconscript}"; then
-        info "Patching AOCL-LibM SConscript: removing AOCC-only -muse-unaligned-vector-move"
-        sed -i "s/ccflags.append('-muse-unaligned-vector-move')/pass  # patched: AOCC-only flag removed for amdclang/" "${sconscript}"
-    fi
-
-    # Patch -Werror: AOCL-LibM's headers redefine CMPLX/CMPLXF macros that
-    # glibc's complex.h already provides (identically). With -Werror this
-    # becomes fatal. Add -Wno-macro-redefined after -Werror in the SConscript.
-    if [[ -f "${sconscript}" ]] && grep -q "'-Werror'" "${sconscript}" && ! grep -q 'Wno-macro-redefined' "${sconscript}"; then
-        info "Patching AOCL-LibM SConscript: adding -Wno-macro-redefined"
-        sed -i "s/'-Werror'/'-Werror', '-Wno-macro-redefined'/" "${sconscript}"
-    fi
-
-    # Patch linker flags for clang compatibility:
-    # 1. -ealm_main → -Wl,-e,alm_main (GCC passes -e to ld; clang doesn't)
-    # 2. Use GNU ld (bfd) for final link: AOCL-LibM's hand-written AVX assembly
-    #    (.S files in src/isa/avx/gas/) uses R_X86_64_64 absolute relocations
-    #    against local symbols. lld rejects these in shared libraries; GNU ld
-    #    handles them via dynamic text relocations. The assembly is correct for
-    #    the target use case (hot math routines that get loaded at fixed offsets).
-    #    AOCL-Utils is built without LTO so its .a contains normal ELF objects.
-    if [[ -f "${sconscript}" ]] && grep -q "'-ealm_main'" "${sconscript}"; then
-        info "Patching AOCL-LibM SConscript: fixing linker flags for amdclang"
-        sed -i "s|'-ealm_main'|'-Wl,-e,alm_main', '-fuse-ld=bfd'|" "${sconscript}"
-    fi
+    # Apply sed patches from YAML (SConscript fixes for amdclang compatibility)
+    apply_patches aocl_libm "${AOCL_LIBM_SRC}"
 
     info "Building AOCL-LibM with amdclang + AVX-512 support..."
 
@@ -410,6 +853,9 @@ build_aocl_libm() {
     # Deactivate the temporary venv
     deactivate
 
+    # Apply post-install patches (patchelf_rpath for libalm.so RPATH fix)
+    apply_patches aocl_libm "${AOCL_LIBM_SRC}"
+
     cd "${VLLM_DIR}"
     success "AOCL-LibM built with AVX-512 Zen 5 optimizations"
 }
@@ -418,12 +864,7 @@ build_aocl_libm() {
 build_python() {
     log_step 7 "Build Python ${CPYTHON_VERSION} from source"
 
-    if [[ -x "${LOCAL_PREFIX}/bin/python3" ]]; then
-        local existing_ver
-        existing_ver="$("${LOCAL_PREFIX}/bin/python3" --version 2>&1 | awk '{print $2}')"
-        info "Python ${existing_ver} already built at ${LOCAL_PREFIX}"
-        return
-    fi
+    if should_skip_step cpython; then return; fi
 
     if [[ ! -d "${CPYTHON_SRC}/.git" ]]; then
         info "Cloning CPython ${CPYTHON_TAG}..."
@@ -534,8 +975,7 @@ create_venv() {
             if ! python -c 'import yaml, mako, packaging, CppHeaderParser' 2>/dev/null \
                || ! command -v ninja &>/dev/null; then
                 info "Installing missing build tools into existing venv..."
-                uv pip install pip ninja cmake wheel setuptools \
-                    "CppHeaderParser==2.7.4" meson PyYAML packaging mako
+                install_pkg_deps venv
             fi
 
             success "Venv activated"
@@ -554,34 +994,10 @@ create_venv() {
         export LD_LIBRARY_PATH="${LOCAL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     fi
 
-    info "Installing essential build tools into venv..."
-    uv pip install pip ninja cmake wheel setuptools \
-        "CppHeaderParser==2.7.4" meson PyYAML packaging mako
+    # Install essential build tools from YAML manifest
+    install_pkg_deps venv
 
     success "Venv created and activated (Python $(python --version 2>&1 | awk '{print $2}'))"
-}
-
-# Step 1: Clone TheRock
-clone_therock() {
-    log_step 1 "Clone TheRock ROCm source (with submodules)"
-
-    if [[ -d "${THEROCK_SRC}/.git" ]]; then
-        info "TheRock already cloned at ${THEROCK_SRC}"
-        cd "${THEROCK_SRC}"
-        git fetch origin
-        local current_branch
-        current_branch="$(git branch --show-current)"
-        git pull origin "${current_branch}"
-        info "Updating submodules..."
-        git submodule update --init --recursive
-        cd "${VLLM_DIR}"
-        success "TheRock source updated"
-        return
-    fi
-
-    info "Cloning TheRock with submodules (this takes several minutes)..."
-    git clone --recursive "${THEROCK_REPO}" "${THEROCK_SRC}"
-    success "TheRock cloned to ${THEROCK_SRC} (with submodules)"
 }
 
 # Step 2: Configure TheRock
@@ -651,8 +1067,7 @@ build_therock() {
 
 
     # Check if already built and installed
-    if [[ -d "${LOCAL_PREFIX}/lib" ]] && find "${LOCAL_PREFIX}" -name 'libamdhip64.so*' -print -quit 2>/dev/null | grep -q .; then
-        info "TheRock already built and installed at ${LOCAL_PREFIX}"
+    if should_skip_step therock; then
         cd "${VLLM_DIR}"
         return
     fi
@@ -661,53 +1076,11 @@ build_therock() {
     info "This is the longest step. Expected time: 2-4 hours."
     info "Monitor progress: tail -f ${VLLM_LOG}"
 
-    # Enable Polly in TheRock's LLVM build.
-    # Polly (polyhedral loop optimizer) restructures loop nests for cache locality.
-    # TheRock's default LLVM_ENABLE_PROJECTS does not include polly — add it so
-    # the built amdclang supports -mllvm -polly for downstream builds.
-    local llvm_prehook="${THEROCK_SRC}/compiler/pre_hook_amd-llvm.cmake"
-    if [[ -f "${llvm_prehook}" ]] && grep -q 'LLVM_ENABLE_PROJECTS' "${llvm_prehook}" && ! grep -q 'polly' "${llvm_prehook}"; then
-        info "Patching TheRock LLVM to enable Polly polyhedral optimizer"
-        sed -i 's|clang;lld;clang-tools-extra;flang|clang;lld;clang-tools-extra;flang;polly|' "${llvm_prehook}"
-    fi
+    # Apply pre-build patches from YAML (Polly, elfutils -Werror, cstdint fixes)
+    apply_patches therock "${THEROCK_SRC}"
 
-    # Patch elfutils cmake wrapper to disable -Werror.
-    # elfutils' config/eu.am unconditionally adds -Werror to every compile.
-    # Modern compilers (Clang 21+, GCC 15+) reject elfutils' implicit
-    # const void* -> struct* conversions from bsearch() returns.
-    # Fix: inject CFLAGS=-Wno-error into the ./configure environment
-    # so autotools receives it and -Werror is effectively neutralized.
-    local elfutils_cmake="${THEROCK_SRC}/third-party/sysdeps/linux/elfutils/CMakeLists.txt"
-    if [[ -f "${elfutils_cmake}" ]] && ! grep -q 'Wno-error' "${elfutils_cmake}"; then
-        info "Patching elfutils CMakeLists.txt to disable -Werror"
-        # shellcheck disable=SC2016  # Intentional: inject literal ${EXTRA_CPPFLAGS} into CMake file
-        sed -i 's|"CPPFLAGS=${EXTRA_CPPFLAGS}"|"CPPFLAGS=${EXTRA_CPPFLAGS}"\n      "CFLAGS=-Wno-error"|' "${elfutils_cmake}"
-    fi
-
-    # Patch rocprofiler-sdk's bundled yaml-cpp: missing <cstdint> include.
-    # Newer compilers (Clang 18+, GCC 13+) removed transitive includes of
-    # <cstdint>, so uint16_t/uint32_t are undeclared without explicit include.
-    local yamlcpp_emitterutils="${THEROCK_SRC}/rocm-systems/projects/rocprofiler-sdk/external/yaml-cpp/src/emitterutils.cpp"
-    if [[ -f "${yamlcpp_emitterutils}" ]] && ! grep -q '<cstdint>' "${yamlcpp_emitterutils}"; then
-        info "Patching rocprofiler-sdk yaml-cpp emitterutils.cpp: add <cstdint>"
-        sed -i '/#include <algorithm>/a #include <cstdint>' "${yamlcpp_emitterutils}"
-    fi
-
-    # Patch rocprofiler-sdk's bundled elfio: missing <cstdint> include.
-    # elfio/elf_types.hpp uses Elf64_Half (uint16_t) etc. without including
-    # <cstdint>. Clang 22 and GCC 15 no longer provide transitive <cstdint>.
-    local elfio_types="${THEROCK_SRC}/rocm-systems/projects/rocprofiler-sdk/external/elfio/elfio/elf_types.hpp"
-    if [[ -f "${elfio_types}" ]] && ! grep -q '<cstdint>' "${elfio_types}"; then
-        info "Patching rocprofiler-sdk elfio elf_types.hpp: add <cstdint>"
-        sed -i '/#define ELFTYPES_H/a #include <cstdint>' "${elfio_types}"
-    fi
-
-    # Install Tensile Python dependencies into the build venv.
-    # hipBLASLt's Tensile kernel generator imports joblib, msgpack, numpy,
-    # pandas, pyyaml at code-generation time. These are not declared as cmake
-    # dependencies — Tensile assumes they are available in the Python environment.
-    info "Installing Tensile Python dependencies into build venv"
-    uv pip install joblib msgpack numpy pandas pyyaml pytest
+    # Install Tensile Python dependencies from YAML manifest
+    install_pkg_deps therock
 
     # Unset amdclang flags and HSA override — TheRock uses GCC and has its
     # own GPU arch detection. Re-source vllm-env.sh after to restore.
@@ -720,28 +1093,8 @@ build_therock() {
     info "Installing TheRock to ${LOCAL_PREFIX}..."
     cmake --install build --prefix "${LOCAL_PREFIX}"
 
-    # Copy MLIR object libraries into the install tree.
-    # TheRock's dist aggregation copies .a and .so files but skips the
-    # objects-Release/ directory that MLIR's cmake exports reference.
-    # These object files are needed by downstream consumers (Triton) that
-    # link MLIR statically via LLVM_SYSPATH.
-    local mlir_objects="${THEROCK_SRC}/build/compiler/amd-llvm/stage/lib/llvm/lib/objects-Release"
-    local install_objects="${LOCAL_PREFIX}/lib/llvm/lib/objects-Release"
-    if [[ -d "${mlir_objects}" ]] && [[ ! -d "${install_objects}" ]]; then
-        info "Copying MLIR object libraries to install tree"
-        cp -a "${mlir_objects}" "${install_objects}"
-    fi
-
-    # Copy LLVM test utilities needed by downstream consumers.
-    # FileCheck is required by Triton's cmake (unconditionally copies it into
-    # the wheel). TheRock builds it but doesn't install it when testing is off.
-    local filecheck_src="${THEROCK_SRC}/build/compiler/amd-llvm/build/bin/FileCheck"
-    local filecheck_dst="${LOCAL_PREFIX}/lib/llvm/bin/FileCheck"
-    if [[ -f "${filecheck_src}" ]] && [[ ! -f "${filecheck_dst}" ]]; then
-        info "Installing FileCheck into LLVM toolchain"
-        cp "${filecheck_src}" "${filecheck_dst}"
-        chmod +x "${filecheck_dst}"
-    fi
+    # Apply post-install patches from YAML (MLIR objects + FileCheck copy)
+    apply_patches therock "${THEROCK_SRC}"
 
     # Restore all flags from vllm-env.sh
     # shellcheck source=vllm-env.sh
@@ -788,6 +1141,9 @@ validate_rocm() {
 
     info "ROCM_PATH: ${ROCM_PATH}"
 
+    # Run YAML-defined validation checks
+    validate_pkg therock
+
     # Check hipcc
     if [[ -x "${ROCM_PATH}/bin/hipcc" ]]; then
         success "hipcc found: $("${ROCM_PATH}"/bin/hipcc --version 2>&1 | head -1)"
@@ -833,51 +1189,6 @@ validate_rocm() {
 # Phase B: ML Framework (PyTorch, ROCm fork)
 # =============================================================================
 
-# Step 9: Clone PyTorch (ROCm fork)
-clone_pytorch() {
-    log_step 9 "Clone PyTorch source (ROCm fork, ${PYTORCH_BRANCH} branch)"
-
-    if [[ -d "${PYTORCH_SRC}/.git" ]]; then
-        info "PyTorch already cloned at ${PYTORCH_SRC}"
-        cd "${PYTORCH_SRC}"
-
-        # Ensure we're tracking the ROCm fork
-        local current_url
-        current_url="$(git remote get-url origin 2>/dev/null)"
-        if [[ "${current_url}" != *"ROCm/pytorch"* ]]; then
-            info "Switching remote from ${current_url} to ${PYTORCH_REPO}"
-            git remote set-url origin "${PYTORCH_REPO}"
-        fi
-
-        # PyTorch's hipify step modifies hundreds of files in-tree (CUDA→HIP).
-        # These must be reset before branch operations, otherwise checkout fails.
-        local dirty_count
-        dirty_count="$(git status --short | wc -l)"
-        if [[ "${dirty_count}" -gt 0 ]]; then
-            info "Resetting ${dirty_count} hipified files in PyTorch tree..."
-            git checkout -- .
-            git submodule foreach --recursive 'git checkout -- . 2>/dev/null || true'
-        fi
-
-        git fetch origin "${PYTORCH_BRANCH}"
-        local current_branch
-        current_branch="$(git branch --show-current)"
-        if [[ "${current_branch}" != "${PYTORCH_BRANCH}" ]]; then
-            info "Switching to ${PYTORCH_BRANCH} branch..."
-            git checkout "${PYTORCH_BRANCH}"
-        fi
-        git pull origin "${PYTORCH_BRANCH}"
-        git submodule update --init --recursive
-        cd "${VLLM_DIR}"
-        success "PyTorch source updated (ROCm fork, ${PYTORCH_BRANCH})"
-        return
-    fi
-
-    info "Cloning ROCm PyTorch (${PYTORCH_BRANCH} branch, with submodules)..."
-    git clone --recursive --branch "${PYTORCH_BRANCH}" "${PYTORCH_REPO}" "${PYTORCH_SRC}"
-    success "PyTorch cloned to ${PYTORCH_SRC} (ROCm fork)"
-}
-
 # Step 10: Build PyTorch
 build_pytorch() {
     log_step 10 "Build PyTorch with ROCm support"
@@ -886,22 +1197,18 @@ build_pytorch() {
 
     # Check if already built — run from VLLM_DIR to avoid importing
     # the local torch/ source directory instead of the installed package.
-    if (cd "${VLLM_DIR}" && python -c "import torch; assert 'rocm' in torch.__file__.lower() or torch.cuda.is_available()") 2>/dev/null; then
-        local torch_ver
-        torch_ver="$(cd "${VLLM_DIR}" && python -c "import torch; print(torch.__version__)")"
-        info "PyTorch ${torch_ver} already built and importable"
+    if should_skip_step pytorch; then
         cd "${VLLM_DIR}"
         return
     fi
 
     # Flags come from vllm-env.sh (sourced at script start, re-sourced after
     # build_python). Verify they're set — if not, something broke the pipeline.
+    # Ensure vllm-env.sh flags are active (CC, CXX, CFLAGS, ROCM_PATH, etc.)
+    _vllm_source_env
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
-    export PATH="${ROCM_PATH}/lib/llvm/bin:${PATH}"
-    export CC="${ROCM_PATH}/lib/llvm/bin/amdclang"
-    export CXX="${ROCM_PATH}/lib/llvm/bin/amdclang++"
 
     info "Building PyTorch for ROCm gfx1151..."
     info "ROCM_PATH=${ROCM_PATH}"
@@ -909,36 +1216,11 @@ build_pytorch() {
     info "CC=${CC}, CXX=${CXX}"
     info "CFLAGS=${CFLAGS}"
 
-    # PyTorch build environment
-    export USE_ROCM=1
-    export USE_CUDA=0
-    export USE_NCCL=0
-    export USE_SYSTEM_NCCL=0
-    export USE_RCCL=1
-    export BUILD_TEST=0
-    export USE_BENCHMARK=0
-    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}"
-    export HIP_PATH="${ROCM_PATH}"
-    export ROCM_HOME="${ROCM_PATH}"
-    export CMAKE_PREFIX_PATH="${ROCM_PATH}"
+    # PyTorch build environment from YAML (build-step-local, not in vllm-env.sh)
+    setup_build_env pytorch
 
-    # Install Python build deps (numpy>=2 for ABI compatibility with our wheel)
-    uv pip install \
-        pip \
-        "numpy>=2.0,<3" \
-        pyyaml \
-        typing_extensions \
-        cmake \
-        ninja \
-        setuptools \
-        wheel \
-        cffi \
-        sympy \
-        filelock \
-        jinja2 \
-        networkx \
-        requests \
-        six
+    # Install Python build deps from YAML manifest
+    install_pkg_deps pytorch
 
     # Convert CUDA references to HIP equivalents (required for ROCm builds)
     if [[ -f "tools/amd_build/build_amd.py" ]]; then
@@ -946,10 +1228,12 @@ build_pytorch() {
         python tools/amd_build/build_amd.py
     fi
 
-    # Patch HIPGraph.hip: hipify creates a set_conditional_handle() function
-    # referencing cudaGraphConditionalHandle (a CUDA 12.4+ type with no HIP
-    # equivalent). The header (HIPGraph.h) doesn't declare it, nothing calls
-    # it on ROCm — it's dead code that fails to compile. Remove it.
+    # Apply patches from YAML (numpy_stub.h, Dependencies.cmake, Context.cpp,
+    # HIPGraph.hip file_rewrite). Sed and file_rewrite patches are applied;
+    # patchelf patches are skipped here (applied to unpacked wheel below).
+    apply_patches pytorch "${PYTORCH_SRC}"
+
+    # HIPGraph.hip: file_rewrite (too complex for YAML, handled inline)
     local _hipgraph="${PYTORCH_SRC}/aten/src/ATen/hip/HIPGraph.hip"
     if [[ -f "${_hipgraph}" ]] && grep -q 'cudaGraphConditionalHandle' "${_hipgraph}"; then
         info "Patching HIPGraph.hip: removing CUDA-only cudaGraphConditionalHandle code"
@@ -967,38 +1251,6 @@ namespace at::cuda {
 
 } // namespace at::cuda
 HIPEOF
-    fi
-
-    # Patch numpy_stub.h: set NPY_TARGET_VERSION to numpy 2.0 C-API (0x12).
-    # Without this, numpy 2.x headers default to compiling against the oldest
-    # compatible API (1.20), producing a .so that crashes at import with numpy
-    # 2.x installed ("module was compiled using NumPy 1.x cannot be run in
-    # NumPy 2.x"). Must be set before #include <numpy/arrayobject.h>.
-    local _numpy_stub="${PYTORCH_SRC}/torch/csrc/utils/numpy_stub.h"
-    if [[ -f "${_numpy_stub}" ]] && ! grep -q 'NPY_TARGET_VERSION' "${_numpy_stub}"; then
-        info "Patching numpy_stub.h: setting NPY_TARGET_VERSION=0x12 (numpy 2.0)"
-        sed -i 's|#include <numpy/arrayobject.h>|// Target numpy 2.0 C-API (0x12) for ABI compatibility with numpy >= 2.0.\n#ifndef NPY_TARGET_VERSION\n#define NPY_TARGET_VERSION 0x00000012\n#endif\n\n#include <numpy/arrayobject.h>|' "${_numpy_stub}"
-    fi
-
-    # Patch cmake/Dependencies.cmake: remove -fclang-abi-compat=17 from HIPCC.
-    # PyTorch adds this "for compat with newer hip-clang C++20 mangling rules",
-    # but it forces HIP device code to use Clang 17 ABI while host code uses
-    # amdclang 22 ABI, causing undefined symbol errors (e.g. const_data_ptr<Half>
-    # mangled differently between libtorch_cpu.so and libtorch_hip.so).
-    local _deps_cmake="${PYTORCH_SRC}/cmake/Dependencies.cmake"
-    if grep -q 'fclang-abi-compat=17' "${_deps_cmake}" 2>/dev/null; then
-        info "Patching Dependencies.cmake: removing -fclang-abi-compat=17 (ABI mismatch fix)"
-        sed -i 's/list(APPEND HIP_HIPCC_FLAGS -fclang-abi-compat=17)/# Removed: causes ABI mismatch with host amdclang 22/' "${_deps_cmake}"
-    fi
-
-    # Patch Context.cpp: add gfx1151 to CK (Composable Kernel) GEMM supported
-    # architectures. Without this, PyTorch logs "Attempting to use CK on an
-    # unsupported architecture!" and TunableOp cannot include CK kernels in its
-    # autotuning candidates. The gate is a hardcoded vector of arch strings.
-    local _context_cpp="${PYTORCH_SRC}/aten/src/ATen/Context.cpp"
-    if [[ -f "${_context_cpp}" ]] && grep -q '"gfx90a", "gfx942", "gfx950"' "${_context_cpp}" && ! grep -q 'gfx1151' "${_context_cpp}"; then
-        info "Patching Context.cpp: adding gfx1151 to CK GEMM supported architectures"
-        sed -i 's/"gfx90a", "gfx942", "gfx950"/"gfx90a", "gfx942", "gfx950", "gfx1151"/' "${_context_cpp}"
     fi
 
     # Step 1: Build the wheel. pip wheel runs cmake (incremental if build/
@@ -1116,25 +1368,6 @@ else:
     success "PyTorch GPU access verified"
 }
 
-# Step 12: Clone TorchVision
-clone_torchvision() {
-    log_step 12 "Clone TorchVision source"
-
-    if [[ -d "${TORCHVISION_SRC}/.git" ]]; then
-        info "TorchVision already cloned at ${TORCHVISION_SRC}"
-        cd "${TORCHVISION_SRC}"
-        git fetch origin
-        git pull origin main
-        cd "${VLLM_DIR}"
-        success "TorchVision source updated"
-        return
-    fi
-
-    info "Cloning TorchVision..."
-    git clone "${TORCHVISION_REPO}" "${TORCHVISION_SRC}"
-    success "TorchVision cloned to ${TORCHVISION_SRC}"
-}
-
 # Step 13: Build TorchVision
 build_torchvision() {
     log_step 13 "Build TorchVision (against source-built PyTorch)"
@@ -1142,22 +1375,16 @@ build_torchvision() {
     cd "${TORCHVISION_SRC}"
 
     # Check if already built
-    if (cd "${VLLM_DIR}" && python -c "import torchvision; print(torchvision.__version__)") 2>/dev/null; then
-        local tv_ver
-        tv_ver="$(cd "${VLLM_DIR}" && python -c "import torchvision; print(torchvision.__version__)")"
-        info "TorchVision ${tv_ver} already built and importable"
+    if should_skip_step torchvision; then
         cd "${VLLM_DIR}"
         return
     fi
 
-    # Use amdclang from TheRock (same compiler as PyTorch)
-    export CC="${ROCM_PATH}/lib/llvm/bin/amdclang"
-    export CXX="${ROCM_PATH}/lib/llvm/bin/amdclang++"
+    # CC/CXX set by vllm-env.sh (amdclang from TheRock)
+    _vllm_source_env
 
-    # TorchVision must find our source-built torch
-    export TORCH_CUDA_ARCH_LIST=""
-    export FORCE_CUDA=0
-    export FORCE_MPS=0
+    # TorchVision build flags from YAML (build-step-local)
+    setup_build_env torchvision
 
     info "Building TorchVision wheel..."
     mkdir -p "${WHEELS_DIR}"
@@ -1184,40 +1411,6 @@ build_torchvision() {
 # Phase D: Kernel Compilers (Triton + AOTriton)
 # =============================================================================
 
-# Step 14: Clone Triton
-clone_triton() {
-    log_step 14 "Clone Triton source (ROCm fork, ${TRITON_BRANCH} branch)"
-
-    if [[ -d "${TRITON_SRC}/.git" ]]; then
-        info "Triton already cloned at ${TRITON_SRC}"
-        cd "${TRITON_SRC}"
-
-        # Ensure we're tracking the ROCm fork, not upstream
-        local current_url
-        current_url="$(git remote get-url origin 2>/dev/null)"
-        if [[ "${current_url}" != *"ROCm/triton"* ]]; then
-            info "Switching remote from ${current_url} to ${TRITON_REPO}"
-            git remote set-url origin "${TRITON_REPO}"
-        fi
-
-        git fetch origin "${TRITON_BRANCH}"
-        local current_branch
-        current_branch="$(git branch --show-current)"
-        if [[ "${current_branch}" != "${TRITON_BRANCH}" ]]; then
-            info "Switching to ${TRITON_BRANCH} branch..."
-            git checkout "${TRITON_BRANCH}"
-        fi
-        git pull origin "${TRITON_BRANCH}"
-        cd "${VLLM_DIR}"
-        success "Triton source updated (ROCm fork, ${TRITON_BRANCH})"
-        return
-    fi
-
-    info "Cloning ROCm Triton (${TRITON_BRANCH} branch)..."
-    git clone --branch "${TRITON_BRANCH}" "${TRITON_REPO}" "${TRITON_SRC}"
-    success "Triton cloned to ${TRITON_SRC} (ROCm fork, ${TRITON_BRANCH})"
-}
-
 # Step 15: Build Triton
 build_triton() {
     log_step 15 "Build Triton with ROCm backend"
@@ -1225,43 +1418,32 @@ build_triton() {
     cd "${TRITON_SRC}"
 
     # Check if already built — look for our wheel in WHEELS_DIR
-    if compgen -G "${WHEELS_DIR}"/triton*.whl >/dev/null 2>&1; then
-        local triton_ver
-        triton_ver="$(python -c "import triton; print(triton.__version__)" 2>/dev/null || true)"
-        if [[ -n "${triton_ver}" ]]; then
-            info "Triton ${triton_ver} already built (wheel exists)"
-            cd "${VLLM_DIR}"
-            return
-        fi
+    if should_skip_step triton; then
+        cd "${VLLM_DIR}"
+        return
     fi
 
     info "Building Triton with ROCm backend..."
     info "ROCM_PATH=${ROCM_PATH}"
 
-    # Triton's setup.py requires pybind11 at import time before pip can
-    # resolve build deps.
-    uv pip install pybind11
+    # Install build dependencies from YAML manifest
+    install_pkg_deps triton
 
     # Validate ROCm toolchain is available.
     if [[ -z "${ROCM_PATH:-}" || ! -d "${ROCM_PATH}/lib/llvm" ]]; then
         die "ROCM_PATH is not set or ${ROCM_PATH:-<unset>}/lib/llvm does not exist. Run TheRock build first (steps 5-8)."
     fi
 
-    # Flags come from vllm-env.sh (CFLAGS, CXXFLAGS, CMAKE_*_FLAGS_RELEASE).
+    # Ensure vllm-env.sh flags are active
+    _vllm_source_env
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
-    export PATH="${ROCM_PATH}/lib/llvm/bin:${PATH}"
-    export CC="${ROCM_PATH}/lib/llvm/bin/amdclang"
-    export CXX="${ROCM_PATH}/lib/llvm/bin/amdclang++"
     info "CC=${CC}"
     info "CXX=${CXX}"
     info "CFLAGS=${CFLAGS}"
     info "CMAKE_CXX_FLAGS_RELEASE=${CMAKE_CXX_FLAGS_RELEASE}"
 
-    # LLVM_SYSPATH: use TheRock's AMD LLVM 22 instead of Triton's bundled LLVM.
-    # This gives Triton access to AMD-specific AMDGPU codegen improvements,
-    # gfx1151 target support, and Polly polyhedral optimizer passes.
     # ccache: ensure /usr/bin is in PATH so uv's isolated build subprocess
     # can find ccache (uv sanitizes PATH in build isolation).
     if command -v ccache &>/dev/null; then
@@ -1283,15 +1465,8 @@ build_triton() {
         triton_pkg_dir="${TRITON_SRC}/python"
     fi
 
-    # Triton's CMakeLists.txt hardcodes -Werror. Our custom-built Python 3.13
-    # pyconfig.h redefines _POSIX_C_SOURCE which triggers -Wmacro-redefined.
-    # With -Werror this becomes fatal. Remove -Werror — Triton's own tests
-    # validate correctness; we don't need warnings-as-errors for our build.
-    local _triton_cmakelists="${TRITON_SRC}/CMakeLists.txt"
-    if grep -q ' -Werror ' "${_triton_cmakelists}" 2>/dev/null; then
-        info "Patching Triton CMakeLists.txt: removing -Werror"
-        sed -i 's/ -Werror / /' "${_triton_cmakelists}"
-    fi
+    # Apply patches from YAML (-Werror removal, AttrsDescriptor __repr__)
+    apply_patches triton "${TRITON_SRC}"
 
     cd "${triton_pkg_dir}"
     mkdir -p "${WHEELS_DIR}"
@@ -1337,26 +1512,6 @@ except ImportError:
     success "Triton validated"
 }
 
-# Step 17: Clone AOTriton
-clone_aotriton() {
-    log_step 17 "Clone AOTriton (ahead-of-time compiled Triton kernels)"
-
-    if [[ -d "${AOTRITON_SRC}/.git" ]]; then
-        info "AOTriton already cloned at ${AOTRITON_SRC}"
-        cd "${AOTRITON_SRC}"
-        git fetch origin
-        git pull origin main
-        git submodule update --init --recursive
-        cd "${VLLM_DIR}"
-        success "AOTriton source updated"
-        return
-    fi
-
-    info "Cloning AOTriton..."
-    git clone --recurse-submodules "${AOTRITON_REPO}" "${AOTRITON_SRC}"
-    success "AOTriton cloned to ${AOTRITON_SRC}"
-}
-
 # Step 18: Build AOTriton
 build_aotriton() {
     log_step 18 "Build AOTriton (pre-compiled attention kernels for gfx1151)"
@@ -1365,8 +1520,7 @@ build_aotriton() {
 
 
     # Check if already built
-    if [[ -f "${LOCAL_PREFIX}/lib/libaotriton_v2.so" ]] || [[ -f "${LOCAL_PREFIX}/lib/libaotriton.a" ]]; then
-        info "AOTriton already built at ${LOCAL_PREFIX}"
+    if should_skip_step aotriton; then
         cd "${VLLM_DIR}"
         return
     fi
@@ -1374,25 +1528,19 @@ build_aotriton() {
     info "Building AOTriton for gfx1151..."
     info "This pre-compiles Triton attention kernels to HSACO (no JIT at inference time)."
 
-    # Upstream ROCm/aotriton main has a stray git rebase "pick" line at the
-    # end of CMakeLists.txt (commit 0383901). Remove it.
-    if grep -q '^pick ' "${AOTRITON_SRC}/CMakeLists.txt" 2>/dev/null; then
-        info "Patching AOTriton CMakeLists.txt: removing stray rebase 'pick' line"
-        sed -i '/^pick /d' "${AOTRITON_SRC}/CMakeLists.txt"
-    fi
+    # Apply patches from YAML (remove stray rebase 'pick' line)
+    apply_patches aotriton "${AOTRITON_SRC}"
 
     # AOTriton's cmake-based build compiles Triton kernels ahead of time
     # into .hsaco binaries for the target GPU architecture.
     # AOTRITON_GPU_BUILD_TIMEOUT=0 disables the per-kernel timeout.
     uv pip install -r requirements.txt 2>/dev/null || pip install -r requirements.txt
 
-    # Flags come from vllm-env.sh (CFLAGS, CXXFLAGS, CMAKE_*_FLAGS_RELEASE).
+    # Ensure vllm-env.sh flags are active (CC, CXX, AOTRITON_INSTALL_DIR, etc.)
+    _vllm_source_env
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
-    export PATH="${ROCM_PATH}/lib/llvm/bin:${PATH}"
-    export CC="${ROCM_PATH}/lib/llvm/bin/amdclang"
-    export CXX="${ROCM_PATH}/lib/llvm/bin/amdclang++"
     info "CC=${CC}"
     info "CFLAGS=${CFLAGS}"
     info "CMAKE_CXX_FLAGS_RELEASE=${CMAKE_CXX_FLAGS_RELEASE}"
@@ -1407,9 +1555,6 @@ build_aotriton() {
 
     ninja -C build install/strip
 
-    # Make AOTriton findable by downstream consumers (PyTorch, vLLM)
-    export AOTRITON_INSTALL_DIR="${LOCAL_PREFIX}"
-
     cd "${VLLM_DIR}"
     success "AOTriton built (pre-compiled attention kernels for gfx1151)"
 }
@@ -1417,26 +1562,6 @@ build_aotriton() {
 # =============================================================================
 # Phase D: Inference Engine (vLLM)
 # =============================================================================
-
-# Step 19: Clone vLLM
-clone_vllm() {
-    log_step 19 "Clone vLLM source"
-
-    if [[ -d "${VLLM_SRC}/.git" ]]; then
-        info "vLLM source already cloned at ${VLLM_SRC}"
-        info "Updating to latest..."
-        cd "${VLLM_SRC}"
-        git fetch origin
-        git pull origin main
-        cd "${VLLM_DIR}"
-        success "vLLM source updated"
-        return
-    fi
-
-    info "Cloning vLLM repository..."
-    git clone "${VLLM_REPO}" "${VLLM_SRC}"
-    success "vLLM cloned to ${VLLM_SRC}"
-}
 
 # Step 20: Patch amdsmi Import Order
 patch_amdsmi_import() {
@@ -1520,75 +1645,18 @@ with open('${init_file}', 'w') as f:
 patch_vllm_gfx1151() {
     log_step 20 "Patch vLLM for gfx1151 AITER support"
 
-    # Patch 1: _aiter_ops.py — extend is_aiter_found_and_supported() to accept gfx1x
-    local _aiter_ops="${VLLM_SRC}/vllm/_aiter_ops.py"
-    if [[ -f "${_aiter_ops}" ]] && ! grep -q 'on_gfx1x' "${_aiter_ops}"; then
-        info "Patching _aiter_ops.py: extending AITER support to gfx1x"
-        sed -i 's/from vllm\.platforms\.rocm import on_gfx9$/from vllm.platforms.rocm import on_gfx1x, on_gfx9/' "${_aiter_ops}"
-        sed -i 's/return on_gfx9()$/return on_gfx9() or on_gfx1x()/' "${_aiter_ops}"
-    else
-        info "_aiter_ops.py: already patched or pattern not found"
-    fi
+    # Apply all sed-type patches from YAML (AITER gfx1x imports, FA backend,
+    # ViT revert, FP8 linear disable, rms_norm guard, fusion skip_duplicates,
+    # sampler bypass, FLA chunk_delta_h fixes, qwen3_next warmup restriction)
+    apply_patches vllm "${VLLM_SRC}"
 
-    # Patch 2: rocm_aiter_fa.py — extend supports_compute_capability() to accept gfx1x
-    local _rocm_aiter_fa="${VLLM_SRC}/vllm/v1/attention/backends/rocm_aiter_fa.py"
-    if [[ -f "${_rocm_aiter_fa}" ]] && ! grep -q 'on_gfx1x' "${_rocm_aiter_fa}"; then
-        info "Patching rocm_aiter_fa.py: extending compute capability to gfx1x"
-        sed -i 's/from vllm\.platforms\.rocm import on_mi3xx/from vllm.platforms.rocm import on_gfx1x, on_mi3xx/' "${_rocm_aiter_fa}"
-        sed -i 's/return on_mi3xx()/return on_mi3xx() or on_gfx1x()/' "${_rocm_aiter_fa}"
-    else
-        info "rocm_aiter_fa.py: already patched or pattern not found"
-    fi
-
-    # Patch 3: rocm.py — ViT attention: KEEP gfx9-only.
-    # The CK fmha_fwd kernel rejects ViT attention dimensions (head_dim,
-    # seq_len combos) on gfx1151 with "invalid argument for fmha_fwd".
-    # The AITER decoder attention (unified + FA) works fine on gfx1x, but
-    # the ViT encoder path must fall through to TRITON_ATTN on RDNA 3.5.
-    # No patch needed — the upstream code already uses on_gfx9() only.
-    # If a previous build applied the gfx1x extension, revert it.
-    local _rocm_py="${VLLM_SRC}/vllm/platforms/rocm.py"
-    if [[ -f "${_rocm_py}" ]] && grep -q 'rocm_aiter_ops.is_enabled() and (on_gfx9() or on_gfx1x())' "${_rocm_py}"; then
-        info "Reverting rocm.py ViT patch: gfx1x AITER FA causes 'invalid argument for fmha_fwd'"
-        sed -i 's/rocm_aiter_ops\.is_enabled() and (on_gfx9() or on_gfx1x())/rocm_aiter_ops.is_enabled() and on_gfx9()/' "${_rocm_py}"
-    else
-        info "rocm.py: ViT attention already gfx9-only (correct for gfx1151)"
-    fi
-
-    # Patch 4: _aiter_ops.py — disable AITER FP8 linear on gfx1x
-    # CK GEMM kernels (module_gemm_a8w8_blockscale) compile but crash at runtime
-    # with GPU page faults on RDNA 3.5 due to CDNA-specific MFMA instructions.
-    # Disabling AITER FP8 linear forces vLLM to use its Triton GEMM fallback.
-    if [[ -f "${_aiter_ops}" ]] && ! grep -q 'on_gfx1x.*is_linear_fp8' "${_aiter_ops}" \
-        && ! grep -q 'from vllm.platforms.rocm import on_gfx1x' "${_aiter_ops}"; then
-        info "Patching _aiter_ops.py: disable AITER FP8 linear on gfx1x (CK GEMM crash)"
-        sed -i '/def is_linear_fp8_enabled(cls) -> bool:/{
-            n
-            s|return cls.is_linear_enabled()|# RDNA 3.5 (gfx1x): CK GEMM kernels (module_gemm_a8w8_blockscale)\
-        # crash with GPU page faults due to CDNA-specific matrix instructions.\
-        # Disable AITER FP8 linear to fall through to vLLM Triton blockscale GEMM.\
-        from vllm.platforms.rocm import on_gfx1x\
-        if on_gfx1x():\
-            return False\
-        return cls.is_linear_enabled()|
-        }' "${_aiter_ops}"
-    else
-        info "_aiter_ops.py: FP8 linear gfx1x patch already applied"
-    fi
-
-    # Patch 5: triton/backends/compiler.py — add __repr__ to AttrsDescriptor
-    # torch Inductor codegen uses {triton_meta!r} to serialize kernel metadata
-    # into generated Triton source files.  AttrsDescriptor has no __repr__,
-    # so Python falls back to object.__repr__() producing angle-bracket output
-    # like <triton.backends.compiler.AttrsDescriptor object at 0x...> which is
-    # invalid Python syntax.  This causes SyntaxError when the generated kernel
-    # file is loaded.  With this patch, torch.compile with Inductor works
-    # correctly on gfx1151 — --enforce-eager is NOT required.
-    # Fix: add __repr__ that produces valid, round-trippable Python via from_dict().
+    # Triton __repr__ patch — applied to INSTALLED package, not source tree.
+    # The source-tree version is handled by apply_patches triton in build_triton().
+    # This catches the case where triton was installed from a pre-built wheel.
     local _triton_compiler
-    _triton_compiler="$(python -c "import triton.backends.compiler; print(triton.backends.compiler.__file__)")"
+    _triton_compiler="$(python -c "import triton.backends.compiler; print(triton.backends.compiler.__file__)" 2>/dev/null || true)"
     if [[ -f "${_triton_compiler}" ]] && ! grep -q '__repr__' "${_triton_compiler}"; then
-        info "Patching triton compiler.py: add __repr__ to AttrsDescriptor (Inductor codegen fix)"
+        info "Patching installed triton compiler.py: add __repr__ to AttrsDescriptor"
         sed -i '/def to_dict(self):/i\
     def __repr__(self):\
         return f'"'"'AttrsDescriptor.from_dict({self.to_dict()!r})'"'"'\
@@ -1597,94 +1665,7 @@ patch_vllm_gfx1151() {
         info "triton compiler.py: AttrsDescriptor __repr__ already present"
     fi
 
-    # Patch 6: rocm_aiter_fusion.py — add skip_duplicates=True to pattern registration
-    # The RocmAiterRMSNormQuantFusionPass registers patterns in a loop over
-    # epsilon × match_aiter_quant combinations.  Some combinations produce
-    # identical pattern graphs, causing torch._inductor.pattern_matcher to
-    # raise "RuntimeError: Duplicate pattern" and crash the engine.
-    # Fix: add skip_duplicates=True to all pm.register_replacement calls.
-    local _aiter_fusion="${VLLM_SRC}/vllm/compilation/passes/fusion/rocm_aiter_fusion.py"
-    if [[ -f "${_aiter_fusion}" ]] && ! grep -q 'skip_duplicates' "${_aiter_fusion}"; then
-        info "Patching rocm_aiter_fusion.py: add skip_duplicates to pattern registration"
-        sed -i '/pm\.register_replacement(/,/)/{
-            s/pm_pass,$/pm_pass, skip_duplicates=True,/
-            s/pm_pass$/pm_pass, skip_duplicates=True/
-        }' "${_aiter_fusion}"
-    else
-        info "rocm_aiter_fusion.py: skip_duplicates already present"
-    fi
-
-    # Patch 7: rocm.py — block +rms_norm custom_ops on gfx1x
-    # On gfx1x (RDNA 3/4, wave32), adding +rms_norm to custom_ops causes
-    # torch.compile/Inductor to generate incorrect code at graph partition
-    # boundaries, producing garbage output.  Both CK and Triton RMSNorm
-    # kernels are correct in isolation; the bug is purely in how Inductor
-    # restructures the compute graph when RMSNorm is an opaque barrier.
-    # Fix: prevent +rms_norm from entering custom_ops on gfx1x.  RMSNorm
-    # stays inline in the Inductor graph and gets fused normally.
-    if [[ -f "${_rocm_py}" ]] && ! grep -q 'not on_gfx1x()' "${_rocm_py}"; then
-        info "Patching rocm.py: block +rms_norm custom_ops on gfx1x (Inductor codegen bug)"
-        sed -i '/and not is_eager_execution/a\            and not on_gfx1x()' "${_rocm_py}"
-    else
-        info "rocm.py: +rms_norm gfx1x guard already present"
-    fi
-
-    # Patch 8: topk_topp_sampler.py — bypass Triton sampler on gfx1151
-    # The Triton top-k/top-p kernel page-faults after torch.compile AOT
-    # compilation on RDNA 3.5.  The PyTorch sort path is functionally
-    # identical and works on all architectures.
-    local _sampler="${VLLM_SRC}/vllm/v1/sample/ops/topk_topp_sampler.py"
-    if [[ -f "${_sampler}" ]] && ! grep -q 'NOTE(gfx1151)' "${_sampler}"; then
-        info "Patching topk_topp_sampler.py: bypass Triton sampler (gfx1151 page fault)"
-        sed -i '/if HAS_TRITON and logits.shape\[0\] >= 8:/,+3{
-            s|    if HAS_TRITON.*|    # NOTE(gfx1151): The Triton top-k/top-p kernel page-faults on RDNA 3.5\n    # after torch.compile AOT compilation. Use the PyTorch sort path instead.\n    # if HAS_TRITON and logits.shape[0] >= 8:\n    #     return apply_top_k_top_p_triton(logits, k, p)|
-            /return apply_top_k_top_p_triton/d
-            /# Use pytorch sort/d
-        }' "${_sampler}"
-    else
-        info "topk_topp_sampler.py: already patched or pattern not found"
-    fi
-
-    # Patch 9: chunk_delta_h.py — AMD autotune restrict + exp() float32 cast
-    # FLA Triton kernels page-fault during autotuning on RDNA 3.5 with higher
-    # pipeline stages (num_stages>2) and larger block sizes (BV=64, K>64).
-    # The exp() type inference bug causes invalid IR on HIP.
-    local _chunk_delta="${VLLM_SRC}/vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
-    if [[ -f "${_chunk_delta}" ]] && ! grep -q 'is_amd' "${_chunk_delta}"; then
-        info "Patching chunk_delta_h.py: AMD autotune restrict + exp() float32 cast"
-        # Import is_amd
-        sed -i 's/from .utils import use_cuda_graph/from .utils import is_amd, use_cuda_graph/' "${_chunk_delta}"
-        # Restrict num_stages on AMD
-        sed -i 's/for num_stages in \[2, 3, 4\]/for num_stages in ([2] if is_amd else [2, 3, 4])/' "${_chunk_delta}"
-        # Restrict BV on AMD
-        sed -i 's/for BV in \[32, 64\]/for BV in ([32] if is_amd else [32, 64])/' "${_chunk_delta}"
-        # Cast exp() operands to float32
-        sed -i '/b_v = b_v \* tl.where(m_t, exp(b_g_last - b_g), 0)/c\
-            # NOTE(gfx1151): Triton HIP compiler fails to infer types for\
-            # exp(scalar_bf16 - block_ptr_load_bf16).  Cast to float32 first\
-            # (also gives better precision for exp computation).\
-            b_g_diff = b_g_last.to(tl.float32) - b_g.to(tl.float32)\
-            b_v = b_v * tl.where(m_t, exp(b_g_diff), 0)[:, None]' "${_chunk_delta}"
-        # Cast b_g_last in second exp()
-        sed -i 's/b_g_last = exp(b_g_last)/b_g_last = exp(b_g_last.to(tl.float32))/' "${_chunk_delta}"
-    else
-        info "chunk_delta_h.py: already patched or pattern not found"
-    fi
-
-    # Patch 10: qwen3_next.py — restrict FLA warmup to T=(64,)
-    # On RDNA 3.5, tl.make_block_ptr page-faults when T < BT (chunk_size=64)
-    # because HIP materializes the out-of-bounds address computation.
-    local _qwen3_next="${VLLM_SRC}/vllm/model_executor/models/qwen3_next.py"
-    if [[ -f "${_qwen3_next}" ]] && ! grep -q 'NOTE(gfx1151)' "${_qwen3_next}"; then
-        info "Patching qwen3_next.py: restrict FLA warmup to T=(64,)"
-        sed -i 's/        for T in (16, 32, 64):/        # NOTE(gfx1151): On RDNA 3.5 (wave32), FLA Triton kernels page-fault\n        # when T < BT (chunk_size=64) due to HIP address computation.\n        for T in (64,):/' "${_qwen3_next}"
-    else
-        info "qwen3_next.py: already patched or pattern not found"
-    fi
-
-    # Patch 11: rotary_embedding/common.py — flash_attn import try/except
-    # On ROCm, flash_attn is a pure-Python wheel without flash_attn_2_cuda.
-    # The import chain flash_attn.ops.triton.rotary -> flash_attn_2_cuda fails.
+    # Rotary embedding: Python-script patch (file_rewrite, too complex for YAML sed)
     local _rotary="${VLLM_SRC}/vllm/model_executor/layers/rotary_embedding/common.py"
     if [[ -f "${_rotary}" ]] && ! grep -q 'flash_attn may be installed' "${_rotary}"; then
         info "Patching rotary_embedding/common.py: flash_attn import try/except"
@@ -1710,11 +1691,12 @@ with open('${_rotary}', 'w') as f:
         info "rotary_embedding/common.py: already patched or pattern not found"
     fi
 
-    # Patch 12: _aiter_ops.py — RMSNorm Triton dispatch for gfx1x
+    # RMSNorm Triton dispatch: Python-script patch (file_rewrite, too complex for YAML sed)
     # The CK RMSNorm (rocm_aiter.rmsnorm2d_fwd_*) uses CDNA asm that doesn't
     # exist on RDNA 3.5.  The Triton versions (aiter.ops.triton.normalization.
     # rmsnorm) work on all architectures but don't accept the
     # use_model_sensitive_rmsnorm=0 kwarg.  Dispatch based on architecture.
+    local _aiter_ops="${VLLM_SRC}/vllm/_aiter_ops.py"
     if [[ -f "${_aiter_ops}" ]] && ! grep -q 'aiter.ops.triton.normalization.rmsnorm' "${_aiter_ops}"; then
         info "Patching _aiter_ops.py: RMSNorm Triton dispatch for gfx1x"
         python3 -c "
@@ -1812,6 +1794,181 @@ with open('${_aiter_ops}', 'w') as f:
         info "_aiter_ops.py: RMSNorm Triton dispatch already present"
     fi
 
+    # Patch 24: config/vllm.py — re-run hybrid alignment after platform config (Bug #16)
+    # ROCm AITER sets block_size=64 via check_and_update_config(), which clobbers
+    # the value computed by HybridAttentionMambaModelConfig (e.g. 576 for Qwen3.5).
+    # Re-run the hybrid alignment after the platform config to restore correct
+    # block_size that satisfies both attention and mamba state requirements.
+    local _vllm_config="${VLLM_SRC}/vllm/config/vllm.py"
+    if [[ -f "${_vllm_config}" ]] && ! grep -q 'Re-run hybrid alignment' "${_vllm_config}"; then
+        info "Patching config/vllm.py: re-run hybrid alignment after platform config"
+        python3 -c "
+with open('${_vllm_config}', 'r') as f:
+    content = f.read()
+
+old = '''        current_platform.check_and_update_config(self)
+
+        # Do this after all the updates to compilation_config.mode'''
+
+new = '''        current_platform.check_and_update_config(self)
+
+        # Re-run hybrid alignment after platform config may have changed
+        # block_size (e.g. ROCm AITER sets block_size=64, which clobbers the
+        # value computed by HybridAttentionMambaModelConfig).
+        if self.model_config is not None and self.model_config.is_hybrid:
+            from vllm.model_executor.models.config import (
+                HybridAttentionMambaModelConfig,
+            )
+            HybridAttentionMambaModelConfig.verify_and_update_config(self)
+
+        # Do this after all the updates to compilation_config.mode'''
+
+content = content.replace(old, new, 1)
+with open('${_vllm_config}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "config/vllm.py: hybrid re-alignment already present"
+    fi
+
+    # Patch 25: models/config.py — platform block_size as alignment minimum (Bug #16)
+    # HybridAttentionMambaModelConfig.verify_and_update_config() computes
+    # attn_block_size as lcm(mamba_state, kernel_alignment).  If the platform
+    # already set a minimum block_size (e.g. ROCm AITER requires 64), use that
+    # as the kernel alignment so the final block_size is compatible with both.
+    local _models_config="${VLLM_SRC}/vllm/model_executor/models/config.py"
+    if [[ -f "${_models_config}" ]] && ! grep -q 'platform already set a minimum' "${_models_config}"; then
+        info "Patching models/config.py: platform block_size as alignment minimum"
+        python3 -c "
+with open('${_models_config}', 'r') as f:
+    content = f.read()
+
+old = '''                kernel_block_alignment_size = 32
+            attn_page_size_1_token'''
+
+new = '''                kernel_block_alignment_size = 32
+            # If the platform already set a minimum block_size (e.g. ROCm
+            # AITER requires 64), use that as the alignment so the computed
+            # attn_block_size is a multiple of the platform's requirement.
+            kernel_block_alignment_size = max(
+                kernel_block_alignment_size, cache_config.block_size
+            )
+            attn_page_size_1_token'''
+
+content = content.replace(old, new, 1)
+with open('${_models_config}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "models/config.py: platform block_size alignment already present"
+    fi
+
+    # Patch 26: rocm.py — skip AITER attention backends for hybrid models (Bug #17)
+    # Hybrid models (e.g. Qwen3.5 GDN) compute non-power-of-2 block sizes from
+    # mamba state alignment (e.g. 576).  AITER unified attention and FA use
+    # TILE_SIZE = block_size in Triton tl.arange(), which requires power of 2
+    # and must fit in LDS.  Skip AITER attention for hybrid models so they fall
+    # through to TRITON_ATTN which decouples tile size from block size.
+    local _rocm_py="${VLLM_SRC}/vllm/platforms/rocm.py"
+    if [[ -f "${_rocm_py}" ]] && ! grep -q '_is_hybrid' "${_rocm_py}"; then
+        info "Patching rocm.py: skip AITER attention for hybrid models"
+        python3 -c "
+with open('${_rocm_py}', 'r') as f:
+    content = f.read()
+
+# The source has single-line if conditions and already imports
+# get_current_vllm_config_or_none for Priority 3. Move the import
+# and vllm_config assignment earlier, add _is_hybrid detection,
+# and gate AITER backends on not _is_hybrid.
+old = '''    backends = []
+
+    # Priority 1: Check for AITER Unified Attention (must check before MHA)
+    if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION:
+        backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+
+    # Priority 2: Check for AITER MHA (Flash Attention)
+    if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA:
+        backends.append(AttentionBackendEnum.ROCM_AITER_FA)
+
+    # Priority 3: Check for ROCM_ATTN (prefill-decode split)
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()'''
+
+new = '''    backends = []
+
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+
+    # Hybrid models (e.g. Qwen3.5 GDN) compute non-power-of-2 block sizes
+    # from mamba state alignment.  AITER unified attention and AITER FA both
+    # use TILE_SIZE = block_size in Triton kernels, which requires a power
+    # of 2 and small enough to fit in LDS.  Skip AITER attention backends
+    # for hybrid models and fall through to TRITON_ATTN.
+    _is_hybrid = (
+        vllm_config is not None
+        and vllm_config.model_config is not None
+        and vllm_config.model_config.is_hybrid
+    )
+
+    # Priority 1: Check for AITER Unified Attention (must check before MHA)
+    if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION and not _is_hybrid:
+        backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+
+    # Priority 2: Check for AITER MHA (Flash Attention)
+    if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA and not _is_hybrid:
+        backends.append(AttentionBackendEnum.ROCM_AITER_FA)
+
+    # Priority 3: Check for ROCM_ATTN (prefill-decode split)'''
+
+content = content.replace(old, new, 1)
+with open('${_rocm_py}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "rocm.py: _is_hybrid guard already present"
+    fi
+
+    # Patch 27: rocm_aiter_unified_attn.py — power-of-2 block_size check (Bug #17)
+    # The AITER unified attention backend's supports_block_size() only checks
+    # block_size % 16 == 0, but the Triton kernel requires power of 2.  Add the
+    # power-of-2 constraint so the backend correctly rejects non-power-of-2
+    # block sizes and falls through to TritonAttentionBackend.
+    local _rocm_aiter_unified="${VLLM_SRC}/vllm/v1/attention/backends/rocm_aiter_unified_attn.py"
+    if [[ -f "${_rocm_aiter_unified}" ]] && ! grep -q 'block_size - 1' "${_rocm_aiter_unified}"; then
+        info "Patching rocm_aiter_unified_attn.py: power-of-2 block_size check"
+        python3 -c "
+with open('${_rocm_aiter_unified}', 'r') as f:
+    content = f.read()
+
+old = '''    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is None:
+            return True
+        return block_size % 16 == 0'''
+
+new = '''    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is None:
+            return True
+        # Must be a multiple of 16 AND a power of 2.
+        # The AITER unified attention Triton kernel uses
+        # TILE_SIZE = block_size in tl.arange(), which requires
+        # a power of 2.  Hybrid models (e.g. Qwen3.5 GDN) compute
+        # non-power-of-2 block sizes from mamba state alignment;
+        # those fall back to TritonAttentionBackend which decouples
+        # tile size from block size.
+        return block_size % 16 == 0 and (block_size & (block_size - 1)) == 0'''
+
+content = content.replace(old, new, 1)
+with open('${_rocm_aiter_unified}', 'w') as f:
+    f.write(content)
+"
+    else
+        info "rocm_aiter_unified_attn.py: power-of-2 check already present or file not found"
+    fi
+
     success "vLLM gfx1151 AITER patches applied"
 }
 
@@ -1819,17 +1976,8 @@ with open('${_aiter_ops}', 'w') as f:
 install_build_deps() {
     log_step 21 "Install build dependencies"
 
-    info "Installing build dependencies..."
-    uv pip install \
-        pip \
-        numba \
-        scipy \
-        "huggingface-hub[cli,hf_transfer]" \
-        setuptools_scm \
-        "numpy>=2.0,<3" \
-        wheel \
-        packaging \
-        ninja
+    # Install build dependencies from YAML manifest
+    install_pkg_deps vllm
 
     success "Build dependencies installed"
 }
@@ -1936,16 +2084,13 @@ build_vllm() {
 
     cd "${VLLM_SRC}"
 
-    # Flags come from vllm-env.sh (CFLAGS, CXXFLAGS, CMAKE_*_FLAGS_RELEASE).
+    # Ensure vllm-env.sh flags are active (CC, CXX, CFLAGS, AOTRITON_INSTALL_DIR)
+    _vllm_source_env
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
-    # ROCm environment for vLLM's setup.py auto-detection
-    export PATH="${ROCM_PATH}/lib/llvm/bin:${PATH}"
-    export CC="${ROCM_PATH}/lib/llvm/bin/amdclang"
-    export CXX="${ROCM_PATH}/lib/llvm/bin/amdclang++"
-    export ROCM_HOME="${ROCM_PATH}"
-    export HIP_PATH="${ROCM_PATH}"
+    # vLLM build environment from YAML (ROCM_HOME, HIP_PATH)
+    setup_build_env vllm
 
     info "Building vLLM with PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}"
     info "CC=${CC}, CXX=${CXX}"
@@ -1953,9 +2098,8 @@ build_vllm() {
     info "CMAKE_CXX_FLAGS_RELEASE=${CMAKE_CXX_FLAGS_RELEASE}"
     info "ROCM_HOME=${ROCM_HOME}"
 
-    # Make AOTriton available if built
+    # Make AOTriton cmake config available (AOTRITON_INSTALL_DIR set by vllm-env.sh)
     if [[ -d "${LOCAL_PREFIX}" ]]; then
-        export AOTRITON_INSTALL_DIR="${LOCAL_PREFIX}"
         export CMAKE_PREFIX_PATH="${LOCAL_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
         info "AOTriton available at ${LOCAL_PREFIX}"
     fi
@@ -2035,31 +2179,6 @@ reinstall_amdsmi() {
     success "amdsmi reinstalled from ROCm"
 }
 
-# Step 26: Clone Flash Attention
-clone_flash_attention() {
-    log_step 26 "Clone Flash Attention (main_perf branch)"
-
-    if [[ -d "${FLASH_ATTN_SRC}/.git" ]]; then
-        info "Flash Attention already cloned at ${FLASH_ATTN_SRC}"
-        cd "${FLASH_ATTN_SRC}"
-        local current_branch
-        current_branch="$(git branch --show-current)"
-        if [[ "${current_branch}" != "main_perf" ]]; then
-            info "Switching to main_perf branch..."
-            git fetch origin main_perf
-            git checkout main_perf
-        fi
-        git pull origin main_perf
-        cd "${VLLM_DIR}"
-        success "Flash Attention source updated (main_perf)"
-        return
-    fi
-
-    info "Cloning Flash Attention (main_perf branch)..."
-    git clone --branch main_perf "${FLASH_ATTN_REPO}" "${FLASH_ATTN_SRC}"
-    success "Flash Attention cloned (main_perf branch)"
-}
-
 # Step 27: Patch Flash Attention amdsmi Import
 patch_flash_amdsmi() {
     log_step 27 "Patch Flash Attention amdsmi import"
@@ -2114,8 +2233,8 @@ build_flash_attention() {
     triton_loc_before="$(python -c "import triton; print(triton.__file__)" 2>/dev/null || echo 'none')"
     info "Triton location before FA build: ${triton_loc_before}"
 
-    # Install Flash Attention deps first (excluding triton — we built it from source)
-    uv pip install einops packaging
+    # Install Flash Attention deps from YAML (excluding triton — we built it from source)
+    install_pkg_deps flash_attention
 
     # Build wheel — no editable install, no triton download from PyPI
     pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
@@ -2215,9 +2334,11 @@ rebuild_aiter() {
     cd "${aiter_src}"
     info "Building amd-aiter wheel from source..."
 
-    # PREBUILD_KERNELS=0 — skip precompilation, kernels JIT on first use.
-    # This avoids the ~45 min full kernel build; step 29b pre-warms them.
-    export PREBUILD_KERNELS=0
+    # Apply YAML-driven patches to AITER source (e.g. TILE_SIZE cap for hybrid models)
+    apply_patches aiter "${aiter_src}"
+
+    # AITER build environment from YAML (PREBUILD_KERNELS=0 — JIT on first use)
+    setup_build_env aiter
 
     pip wheel . --no-build-isolation --no-deps --wheel-dir "${WHEELS_DIR}" -v
 
@@ -3271,15 +3392,7 @@ build_rust_wheels() {
     rust_ver="$(rustc --version | head -1)"
     info "Rust: ${rust_ver}"
 
-    # RUSTFLAGS: target-cpu=znver5 explicitly (not 'native') because Rust's
-    # native detection has a bug where it identifies znver5 but only enables
-    # SSE2. Explicit znver5 gives us all 40+ target features:
-    # AVX-512{F,BW,DQ,VL,VNNI,IFMA,VBMI,VBMI2,BITALG,BF16,VPOPCNTDQ,VP2INTERSECT},
-    # VAES (4x parallel AES in ZMM), VPCLMULQDQ, GFNI, SHA.
-    #
-    # Do NOT add -C lto=thin here — maturin adds -C embed-bitcode=no which
-    # conflicts with -C lto. Maturin manages its own LTO configuration.
-    export RUSTFLAGS="-C target-cpu=znver5 -C opt-level=3"
+    # RUSTFLAGS set in vllm-env.sh (target-cpu=znver5 for full AVX-512)
     info "RUSTFLAGS=${RUSTFLAGS}"
 
     # Rust's linker invokes `cc` which resolves to the amdclang symlink, but
@@ -3287,9 +3400,10 @@ build_rust_wheels() {
     # invoke amdclang by its real name. Unset CFLAGS/CXXFLAGS/LDFLAGS because
     # they contain clang-specific flags (-famd-opt, -mllvm, -mprefer-vector-width)
     # that rustc's internal cc invocations for build scripts don't understand.
-    local _saved_cc="${CC:-}" _saved_cxx="${CXX:-}"
-    local _saved_cflags="${CFLAGS:-}" _saved_cxxflags="${CXXFLAGS:-}"
-    local _saved_ldflags="${LDFLAGS:-}"
+    # Rust builds: use amdclang as linker but unset C flags (they contain
+    # clang-specific -famd-opt, -mllvm, -mprefer-vector-width that rustc's
+    # internal cc invocations for build scripts don't understand).
+    # RUSTFLAGS set by vllm-env.sh (target-cpu=znver5).
     export CC="amdclang" CXX="amdclang++"
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="amdclang"
     unset CFLAGS CXXFLAGS LDFLAGS
@@ -3338,10 +3452,10 @@ build_rust_wheels() {
         success "cryptography wheel built: $(basename "${_crypto_wheel}")"
     fi
 
-    unset RUSTFLAGS CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
+    unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
 
     # Restore CC/CXX/CFLAGS/LDFLAGS for subsequent C/C++ builds
-    export CC="${_saved_cc}" CXX="${_saved_cxx}" CFLAGS="${_saved_cflags}" CXXFLAGS="${_saved_cxxflags}" LDFLAGS="${_saved_ldflags}"
+    _vllm_source_env
 
     success "Rust optimized wheels complete"
 }
@@ -3378,8 +3492,6 @@ build_native_wheels() {
     # the driver's argument tracking — so they're invisible to -Wunused.
     # -famd-opt is a link-time-only driver flag (no-op at compile time), so we
     # move it to LDFLAGS where it takes effect without triggering -Werror.
-    local _saved_cflags="${CFLAGS:-}" _saved_cxxflags="${CXXFLAGS:-}"
-    local _saved_ldflags="${LDFLAGS:-}"
     local _wheel_cflags
     _wheel_cflags="$(echo "${CFLAGS}" | sed -E \
         's/-mllvm (-[^ ]+)/-Xclang -mllvm -Xclang \1/g; s/-famd-opt//g; s/  +/ /g; s/^ +| +$//g')"
@@ -3438,7 +3550,7 @@ build_native_wheels() {
     done
 
     # Restore original CFLAGS/LDFLAGS with driver-level flags
-    export CFLAGS="${_saved_cflags}" CXXFLAGS="${_saved_cxxflags}" LDFLAGS="${_saved_ldflags}"
+    _vllm_source_env
 
     success "C/C++ optimized wheels complete"
 }
@@ -3584,6 +3696,349 @@ export_source_wheels() {
 }
 
 # =============================================================================
+# Phase I: Lemonade Inference Server
+# =============================================================================
+# Lemonade is a unified inference server wrapping llama.cpp (GPU/CPU), FLM (NPU),
+# and ONNX backends behind an OpenAI-compatible API. We build llama.cpp from our
+# own ${VLLM_DIR}/llama.cpp master (with llama-server target) and install the
+# Lemonade SDK (lemonade-sdk) from PyPI. The resulting binaries are placed where the SDK
+# expects them, with a .env file injecting gfx1151 runtime optimizations.
+
+clone_and_build_lemonade() {
+    log_step 33 "Clone Lemonade + build llama.cpp with hipBLAS for gfx1151"
+
+    # Clone both repos using generic clone_pkg (reads flags from YAML)
+    clone_pkg lemonade "${LEMONADE_SRC}" "Lemonade SDK"
+    clone_pkg llamacpp "${LLAMACPP_SRC}" "llama.cpp"
+
+    local _build_dir="${LLAMACPP_SRC}/build-lemonade"
+
+    # Skip if llama-server already built
+    if [[ -x "${_build_dir}/bin/llama-server" ]]; then
+        info "llama.cpp already built at ${_build_dir}/bin/llama-server"
+    else
+        info "Building llama.cpp with hipBLAS for gfx1151 (including llama-server)..."
+
+        # Use amdclang from TheRock with full optimization flags
+        local _cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+        local _cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
+
+        if [[ ! -x "${_cc}" ]]; then
+            warn "TheRock amdclang not found at ${_cc}, falling back to system clang"
+            _cc="clang"
+            _cxx="clang++"
+        fi
+
+        # CPU optimization flags (Zen 5 + Polly + AMD-specific)
+        local _cpu_flags="-O3 -march=native -flto=thin -mprefer-vector-width=512 -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -Wno-error=unused-command-line-argument"
+
+        # GPU optimization flags (RDNA 3.5 gfx1151)
+        local _hip_flags="--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
+
+        cmake -B "${_build_dir}" -S "${LLAMACPP_SRC}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HIP=ON \
+            -DAMDGPU_TARGETS="gfx1151" \
+            -DCMAKE_C_COMPILER="${_cc}" \
+            -DCMAKE_CXX_COMPILER="${_cxx}" \
+            -DCMAKE_HIP_COMPILER="${_cxx}" \
+            -DCMAKE_C_FLAGS_RELEASE="${_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${_cpu_flags}" \
+            -DCMAKE_HIP_FLAGS="${_hip_flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="${LLAMACPP_INSTALL_DIR}"
+
+        cmake --build "${_build_dir}" --config Release -j "$(nproc)"
+        success "llama.cpp build complete"
+    fi
+
+    # --- Install binaries where Lemonade SDK expects them ---
+    mkdir -p "${LLAMACPP_INSTALL_DIR}"
+
+    local _binaries=(llama-server llama-bench llama-cli llama-quantize)
+    for _bin in "${_binaries[@]}"; do
+        if [[ -x "${_build_dir}/bin/${_bin}" ]]; then
+            cp -f "${_build_dir}/bin/${_bin}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
+            info "Installed ${_bin} -> ${LLAMACPP_INSTALL_DIR}/${_bin}"
+        else
+            warn "${_bin} not found in build output"
+        fi
+    done
+
+    # Copy shared libraries (libggml-hip, libllama, libmtmd) needed at runtime.
+    # Ninja/cmake may place .so files in bin/, lib/, src/, or ggml/src/ depending
+    # on the build configuration. Search all known locations.
+    local _lib_count=0
+    for _lib in "${_build_dir}"/bin/*.so* "${_build_dir}"/lib/*.so* "${_build_dir}"/src/*.so* "${_build_dir}"/ggml/src/*.so*; do
+        [[ -f "${_lib}" ]] || continue
+        cp -f "${_lib}" "${LLAMACPP_INSTALL_DIR}/"
+        _lib_count=$(( _lib_count + 1 ))
+    done
+    info "Copied ${_lib_count} shared libraries to ${LLAMACPP_INSTALL_DIR}/"
+
+    # Fix RPATH: cmake bakes build tree paths into RUNPATH. Rewrite to install dir
+    # so binaries find libggml-hip.so/libllama.so without LD_LIBRARY_PATH.
+    if command -v patchelf >/dev/null 2>&1; then
+        for _bin in "${_binaries[@]}"; do
+            [[ -x "${LLAMACPP_INSTALL_DIR}/${_bin}" ]] || continue
+            patchelf --set-rpath "${LLAMACPP_INSTALL_DIR}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
+        done
+        info "RPATH fixed for ROCm binaries -> ${LLAMACPP_INSTALL_DIR}"
+    fi
+
+    # Copy convert_hf_to_gguf.py for GGUF conversion pipeline
+    if [[ -f "${LLAMACPP_SRC}/convert_hf_to_gguf.py" ]]; then
+        cp -f "${LLAMACPP_SRC}/convert_hf_to_gguf.py" "${LLAMACPP_INSTALL_DIR}/convert_hf_to_gguf.py"
+        info "Installed convert_hf_to_gguf.py"
+    fi
+
+    # --- Write version/backend tracking files so Lemonade SDK doesn't re-download ---
+    local _llama_version
+    _llama_version="$(cd "${LLAMACPP_SRC}" && git describe --tags --always 2>/dev/null || echo "master")"
+    echo "${_llama_version}" > "${LLAMACPP_INSTALL_DIR}/version.txt"
+    echo "rocm" > "${LLAMACPP_INSTALL_DIR}/backend.txt"
+    info "Version tracking: ${_llama_version} (rocm backend)"
+
+    # --- Write .env with gfx1151 runtime optimizations ---
+    # Lemonade's server command builder loads .env from the exe directory
+    # (lemonade/tools/server/llamacpp.py line 239). llama.cpp reads LLAMA_ARG_*
+    # env vars via set_env() in common/arg.cpp.
+    # Q8 KV cache (LLAMA_ARG_CACHE_TYPE_K/V=q8_0) omitted — halves KV bandwidth
+    # on unified memory but causes context creation failures on some small models
+    # (qwen2.5 0.5B FP16). Enable per-model during benchmarks.
+    generate_env_file ".packages.llamacpp.backends.rocm.env" \
+        "${LLAMACPP_INSTALL_DIR}/.env" \
+        "gfx1151 runtime optimizations for llama.cpp via Lemonade"
+
+    success "llama.cpp ROCm built and installed for Lemonade (gfx1151, hipBLAS, amdclang)"
+
+    # --- Build Vulkan backend ---
+    # Community benchmarks show Vulkan wins generation speed (44 vs 39 tok/s) and
+    # prefill above ~32K context on gfx1151 (no VMM limitation). We build both
+    # backends so Lemonade/llama-swap can route based on workload.
+    local _vulkan_build_dir="${LLAMACPP_SRC}/build-vulkan"
+
+    if [[ -x "${_vulkan_build_dir}/bin/llama-server" ]]; then
+        info "llama.cpp Vulkan already built at ${_vulkan_build_dir}/bin/llama-server"
+    else
+        info "Building llama.cpp with Vulkan backend..."
+
+        cmake -B "${_vulkan_build_dir}" -S "${LLAMACPP_SRC}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DCMAKE_C_FLAGS_RELEASE="-O3 -march=native -flto=thin -mprefer-vector-width=512" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native -flto=thin -mprefer-vector-width=512" \
+            -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+
+        cmake --build "${_vulkan_build_dir}" --config Release -j "$(nproc)"
+        success "llama.cpp Vulkan build complete"
+    fi
+
+    # --- Install Vulkan binaries ---
+    mkdir -p "${LLAMACPP_VULKAN_DIR}"
+
+    for _bin in "${_binaries[@]}"; do
+        if [[ -x "${_vulkan_build_dir}/bin/${_bin}" ]]; then
+            cp -f "${_vulkan_build_dir}/bin/${_bin}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
+            info "Installed ${_bin} (vulkan) -> ${LLAMACPP_VULKAN_DIR}/${_bin}"
+        else
+            warn "${_bin} (vulkan) not found in build output"
+        fi
+    done
+
+    # Copy Vulkan shared libraries (same search pattern as ROCm)
+    local _vlib_count=0
+    for _lib in "${_vulkan_build_dir}"/bin/*.so* "${_vulkan_build_dir}"/lib/*.so* "${_vulkan_build_dir}"/src/*.so* "${_vulkan_build_dir}"/ggml/src/*.so*; do
+        [[ -f "${_lib}" ]] || continue
+        cp -f "${_lib}" "${LLAMACPP_VULKAN_DIR}/"
+        _vlib_count=$(( _vlib_count + 1 ))
+    done
+    info "Copied ${_vlib_count} shared libraries to ${LLAMACPP_VULKAN_DIR}/"
+
+    # Fix RPATH for Vulkan binaries
+    if command -v patchelf >/dev/null 2>&1; then
+        for _bin in "${_binaries[@]}"; do
+            [[ -x "${LLAMACPP_VULKAN_DIR}/${_bin}" ]] || continue
+            patchelf --set-rpath "${LLAMACPP_VULKAN_DIR}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
+        done
+        info "RPATH fixed for Vulkan binaries -> ${LLAMACPP_VULKAN_DIR}"
+    fi
+
+    # Version tracking for Vulkan backend
+    echo "${_llama_version}" > "${LLAMACPP_VULKAN_DIR}/version.txt"
+    echo "vulkan" > "${LLAMACPP_VULKAN_DIR}/backend.txt"
+
+    # Vulkan .env — no HSA/ROCm vars needed, just batch/KV optimizations
+    # Q8 KV cache omitted (see ROCm .env comment above)
+    generate_env_file ".packages.llamacpp.backends.vulkan.env" \
+        "${LLAMACPP_VULKAN_DIR}/.env" \
+        "gfx1151 runtime optimizations for llama.cpp Vulkan backend"
+
+    success "llama.cpp Vulkan built and installed at ${LLAMACPP_VULKAN_DIR}"
+    success "Both ROCm and Vulkan backends ready for Lemonade"
+}
+
+install_lemonade_sdk() {
+    log_step 34 "Install Lemonade SDK"
+
+    # The Lemonade project split in v10: the git repo (v10.0.0) is a C++ server,
+    # while the Python SDK is published separately as lemonade-sdk on PyPI (v9.1.4).
+    # The SDK handles llama-server process management, model downloads, .env loading,
+    # and hardware detection. We install from PyPI.
+
+    # Check if already installed
+    if python -c "import lemonade" 2>/dev/null; then
+        info "Lemonade SDK already installed in venv"
+        python -c "import lemonade; print(f'  Version: {lemonade.__version__}')" 2>/dev/null || true
+    else
+        info "Installing lemonade-sdk from PyPI..."
+        pip install lemonade-sdk 2>&1
+
+        success "Lemonade SDK installed"
+    fi
+
+    # Install Lemonade's dependencies that aren't already in the venv
+    # (torch, numpy, etc. are already present from earlier phases)
+    info "Installing any missing Lemonade dependencies..."
+    pip install fastapi uvicorn httpx psutil 2>&1 || true
+
+    # Fix version pins: lemonade-sdk 9.1.4 pins strict versions that conflict with
+    # vLLM's requirements (huggingface-hub==0.33.0, onnx==1.18.0, transformers<=4.53.2).
+    # Reinstall at versions that satisfy vLLM. The SDK works fine with newer versions.
+    info "Fixing dependency version conflicts (lemonade-sdk strict pins vs vLLM)..."
+    pip install "transformers>=4.56.0,<5" "huggingface-hub>=0.36.0,<1" "onnx>=1.19.0,<=1.19.0" 2>&1 || true
+
+    # Verify binaries are discoverable
+    info "Verifying Lemonade can find llama.cpp binaries..."
+    if python -c "
+from lemonade.tools.llamacpp.utils import get_llama_server_exe_path
+path = get_llama_server_exe_path('rocm')
+print(f'  llama-server: {path}')
+" 2>/dev/null; then
+        success "Lemonade SDK finds llama-server binary"
+    else
+        warn "Lemonade SDK could not find llama-server via get_llama_server_exe_path('rocm')"
+        info "Binary exists at: ${LLAMACPP_INSTALL_DIR}/llama-server"
+        info "Lemonade may need path configuration — verify during validation step"
+    fi
+
+    # Verify Vulkan backend is also discoverable
+    info "Verifying Vulkan backend discovery..."
+    if python -c "
+from lemonade.tools.llamacpp.utils import get_llama_server_exe_path
+path = get_llama_server_exe_path('vulkan')
+print(f'  llama-server (vulkan): {path}')
+" 2>/dev/null; then
+        success "Lemonade SDK finds Vulkan llama-server binary"
+    else
+        warn "Lemonade SDK could not find Vulkan llama-server"
+    fi
+
+    success "Lemonade SDK installation complete"
+}
+
+validate_lemonade() {
+    log_step 35 "Validate Lemonade installation"
+
+    # Check llama-server binary
+    if [[ ! -x "${LLAMACPP_INSTALL_DIR}/llama-server" ]]; then
+        die "llama-server not found at ${LLAMACPP_INSTALL_DIR}/llama-server"
+    fi
+    success "llama-server binary: ${LLAMACPP_INSTALL_DIR}/llama-server"
+
+    # Check llama-quantize (needed for GGUF conversion pipeline)
+    if [[ -x "${LLAMACPP_INSTALL_DIR}/llama-quantize" ]]; then
+        success "llama-quantize binary: ${LLAMACPP_INSTALL_DIR}/llama-quantize"
+    else
+        warn "llama-quantize not found — GGUF conversion will require manual build"
+    fi
+
+    # Check llama-bench
+    if [[ -x "${LLAMACPP_INSTALL_DIR}/llama-bench" ]]; then
+        success "llama-bench binary: ${LLAMACPP_INSTALL_DIR}/llama-bench"
+    else
+        warn "llama-bench not found — speed benchmarks will require manual build"
+    fi
+
+    # Check .env file
+    if [[ -f "${LLAMACPP_INSTALL_DIR}/.env" ]]; then
+        info ".env optimizations:"
+        while IFS= read -r line; do
+            [[ "${line}" =~ ^#.*$ || -z "${line}" ]] && continue
+            info "  ${line}"
+        done < "${LLAMACPP_INSTALL_DIR}/.env"
+        success ".env file present with gfx1151 optimizations"
+    else
+        warn "No .env file at ${LLAMACPP_INSTALL_DIR}/.env"
+    fi
+
+    # Check version tracking
+    if [[ -f "${LLAMACPP_INSTALL_DIR}/version.txt" ]]; then
+        info "llama.cpp version: $(cat "${LLAMACPP_INSTALL_DIR}/version.txt")"
+    fi
+    if [[ -f "${LLAMACPP_INSTALL_DIR}/backend.txt" ]]; then
+        info "Backend: $(cat "${LLAMACPP_INSTALL_DIR}/backend.txt")"
+    fi
+
+    # Check convert_hf_to_gguf.py
+    if [[ -f "${LLAMACPP_INSTALL_DIR}/convert_hf_to_gguf.py" ]]; then
+        success "convert_hf_to_gguf.py available for GGUF conversion"
+    else
+        warn "convert_hf_to_gguf.py not found — check ${LLAMACPP_SRC}/"
+    fi
+
+    # Check Lemonade SDK import
+    if python -c "import lemonade" 2>/dev/null; then
+        success "Lemonade SDK importable in venv"
+    else
+        warn "Lemonade SDK not importable — run step 34"
+    fi
+
+    # Check shared libraries have correct RPATH
+    local _server="${LLAMACPP_INSTALL_DIR}/llama-server"
+    if command -v readelf >/dev/null 2>&1; then
+        local _rpath
+        _rpath="$(readelf -d "${_server}" 2>/dev/null | grep -oP 'RUNPATH.*\[.*\]' || echo "none")"
+        info "llama-server (rocm) RUNPATH: ${_rpath}"
+    fi
+
+    # --- Validate Vulkan backend ---
+    info "Checking Vulkan backend..."
+    if [[ -x "${LLAMACPP_VULKAN_DIR}/llama-server" ]]; then
+        success "llama-server (vulkan): ${LLAMACPP_VULKAN_DIR}/llama-server"
+        if [[ -f "${LLAMACPP_VULKAN_DIR}/version.txt" ]]; then
+            info "Vulkan llama.cpp version: $(cat "${LLAMACPP_VULKAN_DIR}/version.txt")"
+        fi
+        if [[ -f "${LLAMACPP_VULKAN_DIR}/backend.txt" ]]; then
+            info "Vulkan backend: $(cat "${LLAMACPP_VULKAN_DIR}/backend.txt")"
+        fi
+        if [[ -f "${LLAMACPP_VULKAN_DIR}/.env" ]]; then
+            success "Vulkan .env present"
+        fi
+        if command -v readelf >/dev/null 2>&1; then
+            local _vrpath
+            _vrpath="$(readelf -d "${LLAMACPP_VULKAN_DIR}/llama-server" 2>/dev/null | grep -oP 'RUNPATH.*\[.*\]' || echo "none")"
+            info "llama-server (vulkan) RUNPATH: ${_vrpath}"
+        fi
+    else
+        warn "Vulkan llama-server not found at ${LLAMACPP_VULKAN_DIR}/llama-server"
+        warn "Only ROCm backend available — Vulkan will not be usable for >32K context"
+    fi
+
+    success "Lemonade validation complete (ROCm + Vulkan)"
+}
+
+# =============================================================================
 # Rebuild Mode
 # =============================================================================
 
@@ -3597,10 +4052,15 @@ handle_rebuild() {
             info "Removed ${VLLM_VENV}"
         fi
 
-        for src_dir in "${VLLM_SRC}" "${PYTORCH_SRC}" "${TRITON_SRC}" "${AOTRITON_SRC}" "${FLASH_ATTN_SRC}" "${THEROCK_SRC}" "${CPYTHON_SRC}" "${AOCL_LIBM_SRC}" "${AOCL_UTILS_SRC}"; do
-            if [[ -d "${src_dir}" ]]; then
-                rm -r "${src_dir}"
-                info "Removed ${src_dir}"
+        # Remove all package source directories (read from YAML manifest)
+        local pkg_dirs pkg_dir
+        mapfile -t pkg_dirs < <(ycfg '.packages[].src_dir')
+        for pkg_dir in "${pkg_dirs[@]}"; do
+            [[ -z "${pkg_dir}" ]] && continue
+            local full_path="${VLLM_DIR}/${pkg_dir}"
+            if [[ -d "${full_path}" ]]; then
+                rm -r "${full_path}"
+                info "Removed ${full_path}"
             fi
         done
 
@@ -3622,15 +4082,17 @@ main() {
     info "Build log: ${VLLM_LOG}"
     info "Start step: ${START_STEP}"
     info "Rebuild: ${REBUILD}"
-    info "Components: TheRock → AOCL-LibM → Python → PyTorch → Triton → AOTriton → vLLM → Flash Attention → Optimized Wheels"
+    info "Components: TheRock → AOCL-LibM → Python → PyTorch → Triton → AOTriton → vLLM → Flash Attention → Optimized Wheels → Lemonade"
     echo ""
 
     check_prerequisites
     handle_rebuild
 
     # Set up PATH/LD_LIBRARY_PATH for the unified LOCAL_PREFIX.
-    # This runs unconditionally so that --step N resumes work correctly:
-    # every step after TheRock (step 1) needs amdclang and ROCm libs on PATH.
+    # Duplicates vllm-env.sh logic intentionally: on a fresh build, TheRock
+    # (steps 1-4) creates LOCAL_PREFIX/lib AFTER vllm-env.sh was sourced,
+    # so these paths wouldn't be set yet. On --step N resume builds,
+    # vllm-env.sh already set them at source time.
     if [[ -d "${LOCAL_PREFIX}/lib" ]]; then
         export ROCM_PATH="${LOCAL_PREFIX}"
         export LD_LIBRARY_PATH="${LOCAL_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -3644,61 +4106,51 @@ main() {
         fi
     fi
 
-    # Build pipeline — skip steps below START_STEP
-    # Phase A: ROCm SDK (TheRock — builds amdclang used by everything downstream)
-    [[ "${START_STEP}" -le 1 ]]  && clone_therock
-    [[ "${START_STEP}" -le 2 ]]  && configure_therock
-    [[ "${START_STEP}" -le 3 ]]  && build_therock
-    [[ "${START_STEP}" -le 4 ]]  && validate_rocm
+    # Build pipeline — dispatch steps from YAML manifest.
+    # Step entries can be:
+    #   - A string: shell function name (called directly)
+    #   - A list:   multiple shell functions at the same step number
+    #   - An object with {clone: <pkg_key>, desc: "..."}: dispatched to clone_pkg()
+    # --step N skips all steps below N.
+    local step_num
+    for step_num in $(seq 1 "${TOTAL_STEPS}"); do
+        [[ "${START_STEP}" -le "${step_num}" ]] || continue
 
-    # Phase B: CPU Libraries + Python (built with amdclang from Phase A)
-    [[ "${START_STEP}" -le 5 ]]  && build_aocl_utils
-    [[ "${START_STEP}" -le 6 ]]  && build_aocl_libm
-    [[ "${START_STEP}" -le 7 ]]  && build_python
-    [[ "${START_STEP}" -le 8 ]]  && create_venv
+        local step_val
+        step_val="$(ycfg ".steps.\"${step_num}\"")"
+        [[ -z "${step_val}" ]] && continue
 
-    # Phase C: PyTorch + TorchVision (ROCm fork)
-    [[ "${START_STEP}" -le 9 ]]  && clone_pytorch
-    [[ "${START_STEP}" -le 10 ]] && build_pytorch
-    [[ "${START_STEP}" -le 11 ]] && validate_pytorch
-    [[ "${START_STEP}" -le 12 ]] && clone_torchvision
-    [[ "${START_STEP}" -le 13 ]] && build_torchvision
+        # Check if this step is a clone object (has a .clone key).
+        # yq errors when indexing a list/scalar with .clone, so || true is needed.
+        local clone_key
+        clone_key="$(ycfg ".steps.\"${step_num}\".clone" 2>/dev/null || true)"
+        if [[ -n "${clone_key}" ]]; then
+            local clone_desc
+            clone_desc="$(ycfg ".steps.\"${step_num}\".desc" 2>/dev/null || true)"
+            local clone_src
+            clone_src="${VLLM_DIR}/$(pkg "${clone_key}" src_dir)"
+            log_step "${step_num}" "Clone ${clone_desc:-${clone_key}}"
+            clone_pkg "${clone_key}" "${clone_src}" "${clone_desc:-${clone_key}}"
+            continue
+        fi
 
-    # Phase D: Kernel Compilers (Triton + AOTriton)
-    [[ "${START_STEP}" -le 14 ]] && clone_triton
-    [[ "${START_STEP}" -le 15 ]] && build_triton
-    [[ "${START_STEP}" -le 16 ]] && validate_triton
-    [[ "${START_STEP}" -le 17 ]] && clone_aotriton
-    [[ "${START_STEP}" -le 18 ]] && build_aotriton
+        # Check if this step is a list (multiple functions)
+        local funcs
+        mapfile -t funcs < <(ycfg ".steps.\"${step_num}\"[]" 2>/dev/null || true)
+        if [[ ${#funcs[@]} -eq 0 ]]; then
+            # Scalar string: single function name
+            funcs=("${step_val}")
+        fi
 
-    # Phase E: vLLM
-    [[ "${START_STEP}" -le 19 ]] && clone_vllm
-    [[ "${START_STEP}" -le 20 ]] && patch_amdsmi_import
-    [[ "${START_STEP}" -le 20 ]] && patch_vllm_gfx1151
-    [[ "${START_STEP}" -le 21 ]] && install_build_deps
-    [[ "${START_STEP}" -le 22 ]] && run_use_existing_torch
-    [[ "${START_STEP}" -le 23 ]] && install_rocm_requirements
-    [[ "${START_STEP}" -le 24 ]] && build_vllm
-
-    # Phase F: Flash Attention
-    [[ "${START_STEP}" -le 25 ]] && reinstall_amdsmi
-    [[ "${START_STEP}" -le 26 ]] && clone_flash_attention
-    [[ "${START_STEP}" -le 27 ]] && patch_flash_amdsmi
-    [[ "${START_STEP}" -le 28 ]] && build_flash_attention
-
-    # Phase F (cont): Rebuild AITER from source + gfx1151 patches
-    [[ "${START_STEP}" -le 28 ]] && rebuild_aiter
-    [[ "${START_STEP}" -le 28 ]] && patch_aiter_gfx1151
-
-    # Phase G: Validation + Warmup
-    [[ "${START_STEP}" -le 29 ]] && smoke_test
-    [[ "${START_STEP}" -le 29 ]] && warmup_aiter_jit
-    [[ "${START_STEP}" -le 29 ]] && warmup_tunableop
-
-    # Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
-    [[ "${START_STEP}" -le 30 ]] && build_rust_wheels
-    [[ "${START_STEP}" -le 31 ]] && build_native_wheels
-    [[ "${START_STEP}" -le 32 ]] && export_source_wheels
+        for func in "${funcs[@]}"; do
+            [[ -z "${func}" ]] && continue
+            if declare -f "${func}" >/dev/null 2>&1; then
+                "${func}"
+            else
+                die "Step ${step_num}: function '${func}' not found (check YAML steps: section)"
+            fi
+        done
+    done
 }
 
 main "$@"
