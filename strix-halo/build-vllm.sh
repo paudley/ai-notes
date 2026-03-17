@@ -3523,84 +3523,68 @@ if failed > 0:
     success "AITER JIT pre-warm: ${built_count} modules compiled in ${jit_dir}"
 }
 
-# Step 29c: TunableOp GEMM warmup
-# Runs a brief inference warmup with PYTORCH_TUNABLEOP_ENABLED=1 to populate
-# the TunableOp CSV cache with optimal GEMM kernel selections for gfx1151.
-# The CSV is model-specific (different models produce different GEMM shapes),
-# so this uses the director model configured in .env as the primary workload.
-# Subsequent vLLM starts with the same model skip the tuning phase entirely.
-warmup_tunableop() {
-    log_step 29 "TunableOp GEMM warmup"
+# Step 36: Backend Smoke Test
+# Downloads a tiny model (SmolLM2-135M-Instruct, ~270 MB FP16 / ~70 MB Q4 GGUF)
+# and runs actual inference through every installed backend:
+#   1. vLLM      – offline LLM inference + TunableOp CSV warmup as side effect
+#   2. llama.cpp – ROCm (hipBLAS) via llama-cli
+#   3. llama.cpp – Vulkan via llama-cli
+#   4. Lemonade  – SDK API
+#   5. Ollama    – REST API (if ollama is installed and running)
+#
+# Model config is read from the top-level smoke_test: section in YAML.
+# Individual backend failures are non-fatal — a summary table is printed at
+# the end showing PASS / FAIL / SKIP for each backend.
+backend_smoke_test() {
+    log_step 36 "Backend smoke test (all inference backends)"
 
-    local tunableop_csv="${VLLM_DIR}/tunableop_results_gfx11510.csv"
+    # ── Read config from YAML ────────────────────────────────────────────
+    local hf_model gguf_repo gguf_file test_prompt max_tokens
+    hf_model="$(ycfg '.smoke_test.hf_model')"
+    gguf_repo="$(ycfg '.smoke_test.gguf_repo')"
+    gguf_file="$(ycfg '.smoke_test.gguf_file')"
+    test_prompt="$(ycfg '.smoke_test.prompt')"
+    max_tokens="$(ycfg '.smoke_test.max_tokens')"
 
-    # Skip if CSV already has substantial content (>10 tuned kernels)
-    if [[ -f "${tunableop_csv}" ]]; then
-        local line_count
-        line_count="$(wc -l < "${tunableop_csv}")"
-        if [[ "${line_count}" -gt 10 ]]; then
-            info "TunableOp CSV already populated (${line_count} entries): ${tunableop_csv}"
-            return 0
+    if [[ -z "${hf_model}" ]]; then
+        die "smoke_test.hf_model not set in YAML"
+    fi
+
+    # Results tracking (associative array: backend -> PASS|FAIL|SKIP)
+    declare -A results
+
+    # ── Download models ──────────────────────────────────────────────────
+    info "Downloading smoke test model: ${hf_model}"
+    python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('${hf_model}')
+print('HF model cached successfully')
+" || die "Failed to download HF model: ${hf_model}"
+    success "HF model ready: ${hf_model}"
+
+    local gguf_path=""
+    if [[ -n "${gguf_repo}" && -n "${gguf_file}" ]]; then
+        info "Downloading GGUF: ${gguf_repo} / ${gguf_file}"
+        gguf_path="$(python -c "
+from huggingface_hub import hf_hub_download
+path = hf_hub_download('${gguf_repo}', '${gguf_file}')
+print(path)
+" | tail -1)" || {
+            warn "Failed to download GGUF — llama.cpp tests will be skipped"
+            gguf_path=""
+        }
+        if [[ -n "${gguf_path}" ]]; then
+            success "GGUF ready: ${gguf_path}"
         fi
     fi
 
-    # Source .env if available to get model configuration
-    local env_file="${_SCRIPT_DIR}/.env"
-    if [[ ! -f "${env_file}" ]]; then
-        info "No .env file found — skipping TunableOp warmup (requires model config)"
-        info "Run 'vllm-start.sh' with TunableOp enabled to populate CSV on first inference"
-        return 0
-    fi
+    # ── Backend 1/5: vLLM (offline inference + TunableOp warmup) ─────────
+    section "Backend 1/5: vLLM (offline inference + TunableOp warmup)"
 
-    # Read the director model from .env (the primary/largest model)
-    set -a
-    # shellcheck source=/dev/null
-    source "${env_file}"
-    set +a
+    local tunableop_csv="${VLLM_DIR}/tunableop_results_gfx11510.csv"
+    info "TunableOp CSV: ${tunableop_csv}"
 
-    local model="${VLLM_DIRECTOR_MODEL:-}"
-    if [[ -z "${model}" ]]; then
-        info "VLLM_DIRECTOR_MODEL not set in .env — skipping TunableOp warmup"
-        info "TunableOp will auto-tune on first inference with each model"
-        return 0
-    fi
-
-    # Check if model files exist locally
-    local model_path
-    model_path="$(python -c "
-from pathlib import Path
-import os
-model = '${model}'
-# Check common HuggingFace cache locations
-for base in [os.path.expanduser('~/.cache/huggingface/hub'), '/opt/models']:
-    p = Path(base) / ('models--' + model.replace('/', '--'))
-    if p.exists():
-        print(p)
-        break
-    p = Path(base) / model
-    if p.exists():
-        print(p)
-        break
-" 2>/dev/null || true)"
-
-    if [[ -z "${model_path}" ]]; then
-        info "Model '${model}' not found in local cache — skipping TunableOp warmup"
-        info "TunableOp will auto-tune on first inference when the model is loaded"
-        return 0
-    fi
-
-    info "Running TunableOp warmup with model: ${model}"
-    info "CSV output: ${tunableop_csv}"
-
-    # Enable TunableOp and run a brief vLLM offline inference to discover
-    # GEMM shapes and benchmark kernel candidates.
-    export PYTORCH_TUNABLEOP_ENABLED=1
-    export PYTORCH_TUNABLEOP_FILENAME="${tunableop_csv}"
-    export PYTORCH_TUNABLEOP_TUNING=1
-
-    # Use vLLM's offline LLMEngine to load the model and run a few prompts.
-    # This exercises the full GEMM dispatch path without starting a server.
-    python -c "
+    if python -c "
 import os
 os.environ['PYTORCH_TUNABLEOP_ENABLED'] = '1'
 os.environ['PYTORCH_TUNABLEOP_FILENAME'] = '${tunableop_csv}'
@@ -3608,43 +3592,213 @@ os.environ['PYTORCH_TUNABLEOP_TUNING'] = '1'
 
 from vllm import LLM, SamplingParams
 
-print('Loading model for TunableOp warmup...')
+print('Loading model: ${hf_model}')
 llm = LLM(
-    model='${model}',
-    max_model_len=2048,
-    gpu_memory_utilization=0.5,
+    model='${hf_model}',
+    max_model_len=512,
+    gpu_memory_utilization=0.3,
     enforce_eager=True,  # No graph capture during tuning
 )
 
-# Run a few prompts of varying length to exercise different GEMM shapes.
-# Short prompt exercises different matrix dimensions than long prompt.
+# Multiple prompt lengths exercise different GEMM shapes for TunableOp.
 prompts = [
-    'Hello',
+    '${test_prompt}',
     'Explain the theory of relativity in simple terms.',
-    'Write a detailed analysis of the economic impacts of climate change on ' * 10,
+    'Write a short story about a robot. ' * 5,
 ]
-params = SamplingParams(temperature=0.0, max_tokens=32)
+params = SamplingParams(temperature=0.0, max_tokens=${max_tokens})
 
-print('Running TunableOp warmup inference passes...')
+print('Running inference (TunableOp tuning active)...')
 outputs = llm.generate(prompts, params)
 for out in outputs:
-    print(f'  Prompt tokens: {len(out.prompt_token_ids)}, '
-          f'Output tokens: {len(out.outputs[0].token_ids)}')
+    text = out.outputs[0].text.strip()
+    print(f'  [{len(out.prompt_token_ids)} tok in -> {len(out.outputs[0].token_ids)} tok out] {text[:80]}')
+    assert len(text) > 0, f'Empty output for prompt: {out.prompt[:40]}...'
 
-print(f'TunableOp CSV written to: ${tunableop_csv}')
-" || {
-        warn "TunableOp warmup failed — CSV will be populated on first regular inference"
-        return 0
-    }
-
-    # Report results
-    if [[ -f "${tunableop_csv}" ]]; then
-        local csv_lines
-        csv_lines="$(wc -l < "${tunableop_csv}")"
-        success "TunableOp warmup complete: ${csv_lines} kernel entries in ${tunableop_csv}"
+print('PASS')
+"; then
+        results[vllm]="PASS"
+        success "vLLM: PASS"
+        if [[ -f "${tunableop_csv}" ]]; then
+            local csv_lines
+            csv_lines="$(wc -l < "${tunableop_csv}")"
+            info "TunableOp CSV populated: ${csv_lines} kernel entries"
+        fi
     else
-        warn "TunableOp CSV not created — tuning will occur on first inference"
+        results[vllm]="FAIL"
+        warn "vLLM: FAIL"
     fi
+
+    # ── Backend 2/5: llama.cpp ROCm (hipBLAS) ────────────────────────────
+    section "Backend 2/5: llama.cpp ROCm (hipBLAS)"
+
+    if [[ -z "${gguf_path}" ]]; then
+        results[llamacpp_rocm]="SKIP"
+        warn "llama.cpp ROCm: SKIP (no GGUF model)"
+    elif [[ ! -x "${LLAMACPP_INSTALL_DIR}/llama-cli" ]]; then
+        results[llamacpp_rocm]="SKIP"
+        warn "llama.cpp ROCm: SKIP (llama-cli not found at ${LLAMACPP_INSTALL_DIR}/llama-cli)"
+    else
+        info "Running: ${LLAMACPP_INSTALL_DIR}/llama-cli -m ${gguf_file}"
+        local _rocm_output
+        if _rocm_output="$("${LLAMACPP_INSTALL_DIR}/llama-cli" \
+            -m "${gguf_path}" \
+            -p "${test_prompt}" \
+            -n "${max_tokens}" \
+            --no-display-prompt \
+            -ngl 99 \
+            2>/dev/null)"; then
+            _rocm_output="$(echo "${_rocm_output}" | tr -d '\n' | head -c 200)"
+            if [[ -n "${_rocm_output}" ]]; then
+                results[llamacpp_rocm]="PASS"
+                success "llama.cpp ROCm: PASS"
+                info "  Output: ${_rocm_output:0:80}"
+            else
+                results[llamacpp_rocm]="FAIL"
+                warn "llama.cpp ROCm: FAIL (empty output)"
+            fi
+        else
+            results[llamacpp_rocm]="FAIL"
+            warn "llama.cpp ROCm: FAIL (inference error)"
+        fi
+    fi
+
+    # ── Backend 3/5: llama.cpp Vulkan ────────────────────────────────────
+    section "Backend 3/5: llama.cpp Vulkan"
+
+    if [[ -z "${gguf_path}" ]]; then
+        results[llamacpp_vulkan]="SKIP"
+        warn "llama.cpp Vulkan: SKIP (no GGUF model)"
+    elif [[ ! -x "${LLAMACPP_VULKAN_DIR}/llama-cli" ]]; then
+        results[llamacpp_vulkan]="SKIP"
+        warn "llama.cpp Vulkan: SKIP (llama-cli not found at ${LLAMACPP_VULKAN_DIR}/llama-cli)"
+    else
+        info "Running: ${LLAMACPP_VULKAN_DIR}/llama-cli -m ${gguf_file}"
+        local _vulkan_output
+        if _vulkan_output="$("${LLAMACPP_VULKAN_DIR}/llama-cli" \
+            -m "${gguf_path}" \
+            -p "${test_prompt}" \
+            -n "${max_tokens}" \
+            --no-display-prompt \
+            -ngl 99 \
+            2>/dev/null)"; then
+            _vulkan_output="$(echo "${_vulkan_output}" | tr -d '\n' | head -c 200)"
+            if [[ -n "${_vulkan_output}" ]]; then
+                results[llamacpp_vulkan]="PASS"
+                success "llama.cpp Vulkan: PASS"
+                info "  Output: ${_vulkan_output:0:80}"
+            else
+                results[llamacpp_vulkan]="FAIL"
+                warn "llama.cpp Vulkan: FAIL (empty output)"
+            fi
+        else
+            results[llamacpp_vulkan]="FAIL"
+            warn "llama.cpp Vulkan: FAIL (inference error)"
+        fi
+    fi
+
+    # ── Backend 4/5: Lemonade SDK ────────────────────────────────────────
+    section "Backend 4/5: Lemonade SDK"
+
+    if ! python -c "import lemonade" 2>/dev/null; then
+        results[lemonade]="SKIP"
+        warn "Lemonade: SKIP (SDK not importable)"
+    elif [[ -z "${gguf_path}" ]]; then
+        results[lemonade]="SKIP"
+        warn "Lemonade: SKIP (no GGUF model)"
+    else
+        info "Running Lemonade SDK inference..."
+        if python -c "
+from lemonade.api import from_pretrained
+
+print('Loading model via Lemonade: ${gguf_file}')
+model = from_pretrained(
+    '${gguf_path}',
+    recipe='llamacpp',
+)
+output = model.generate('${test_prompt}', max_new_tokens=${max_tokens})
+text = output['response'].strip()
+print(f'  Output: {text[:80]}')
+assert len(text) > 0, 'Empty output from Lemonade'
+print('PASS')
+" 2>&1; then
+            results[lemonade]="PASS"
+            success "Lemonade: PASS"
+        else
+            results[lemonade]="FAIL"
+            warn "Lemonade: FAIL"
+        fi
+    fi
+
+    # ── Backend 5/5: Ollama ──────────────────────────────────────────────
+    section "Backend 5/5: Ollama"
+
+    if ! command -v ollama &>/dev/null; then
+        results[ollama]="SKIP"
+        warn "Ollama: SKIP (not installed)"
+    elif ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+        results[ollama]="SKIP"
+        warn "Ollama: SKIP (service not running — start with 'ollama serve')"
+    else
+        # Pull the model (Ollama handles GGUF conversion internally)
+        local ollama_model="smollm2:135m"
+        info "Pulling Ollama model: ${ollama_model}"
+        if ollama pull "${ollama_model}" 2>/dev/null; then
+            info "Running Ollama inference..."
+            local _ollama_output
+            if _ollama_output="$(curl -sf http://localhost:11434/api/generate \
+                -d "{\"model\": \"${ollama_model}\", \"prompt\": \"${test_prompt}\", \"stream\": false}" \
+                2>/dev/null | python -c "import sys,json; print(json.load(sys.stdin).get('response',''))" \
+                2>/dev/null)"; then
+                _ollama_output="$(echo "${_ollama_output}" | tr -d '\n' | head -c 200)"
+                if [[ -n "${_ollama_output}" ]]; then
+                    results[ollama]="PASS"
+                    success "Ollama: PASS"
+                    info "  Output: ${_ollama_output:0:80}"
+                else
+                    results[ollama]="FAIL"
+                    warn "Ollama: FAIL (empty response)"
+                fi
+            else
+                results[ollama]="FAIL"
+                warn "Ollama: FAIL (API error)"
+            fi
+        else
+            results[ollama]="FAIL"
+            warn "Ollama: FAIL (could not pull model)"
+        fi
+    fi
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    section "Backend Smoke Test Summary"
+
+    local pass_count=0 fail_count=0 skip_count=0
+    local backends=(vllm llamacpp_rocm llamacpp_vulkan lemonade ollama)
+    local labels=("vLLM" "llama.cpp ROCm" "llama.cpp Vulkan" "Lemonade SDK" "Ollama")
+
+    printf "  %-20s %s\n" "Backend" "Result"
+    printf "  %-20s %s\n" "-------" "------"
+    for i in "${!backends[@]}"; do
+        local key="${backends[$i]}"
+        local label="${labels[$i]}"
+        local result="${results[$key]:-SKIP}"
+        case "${result}" in
+            PASS) printf "  %-20s ✓ PASS\n" "${label}"; ((pass_count++)) ;;
+            FAIL) printf "  %-20s ✗ FAIL\n" "${label}"; ((fail_count++)) ;;
+            SKIP) printf "  %-20s - SKIP\n" "${label}"; ((skip_count++)) ;;
+        esac
+    done
+    echo ""
+    info "Results: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
+
+    if [[ "${fail_count}" -gt 0 ]]; then
+        warn "Some backends failed — review output above for details"
+    fi
+    if [[ "${pass_count}" -eq 0 ]]; then
+        die "All backends failed or were skipped — build is not functional"
+    fi
+
+    success "Backend smoke test complete: ${pass_count}/${#backends[@]} backends operational"
 }
 
 # =============================================================================
@@ -4357,7 +4511,7 @@ main() {
     info "Build log: ${VLLM_LOG}"
     info "Start step: ${START_STEP}"
     info "Rebuild: ${REBUILD}"
-    info "Components: TheRock → AOCL-LibM → Python → PyTorch → Triton → AOTriton → vLLM → Flash Attention → Optimized Wheels → Lemonade"
+    info "Components: TheRock → AOCL-LibM → Python → PyTorch → Triton → AOTriton → vLLM → Flash Attention → Optimized Wheels → Lemonade → Smoke Test"
     echo ""
 
     check_prerequisites

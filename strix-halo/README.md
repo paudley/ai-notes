@@ -239,7 +239,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 
 | File | Description |
 |------|-------------|
-| `build-vllm.sh` | Master build script (35-step pipeline) |
+| `build-vllm.sh` | Master build script (36-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
 | `vllm-packages.yaml` | Package manifest (repos, branches, patches, per-distro prerequisites, bootstrap config) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |

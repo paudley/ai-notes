@@ -89,10 +89,24 @@ platform:
 
 build:
   vllm_dir: "/opt/src/vllm"
-  total_steps: 35
+  total_steps: 36
   cpython_version: "3.13.12"
   disk_required_gb: 100
   clang_min_version: 21
+
+# =============================================================================
+# Smoke Test: tiny model used to validate all inference backends post-build
+# =============================================================================
+# SmolLM2-135M-Instruct: 135M params, ~270 MB FP16, ~70 MB Q4 GGUF.
+# Small enough to load in seconds on any GPU; large enough to prove the
+# full inference stack (tokenizer → model → sampling → detokenizer) works.
+
+smoke_test:
+  hf_model: "HuggingFaceTB/SmolLM2-135M-Instruct"
+  gguf_repo: "bartowski/SmolLM2-135M-Instruct-GGUF"
+  gguf_file: "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+  prompt: "What is 2+2? Answer in one word."
+  max_tokens: 16
 
 # =============================================================================
 # Prerequisites: system packages and commands required before building
@@ -212,7 +226,7 @@ steps:
   28: [build_flash_attention, rebuild_aiter, patch_aiter_gfx1151]
 
   # Phase G: Validation + Warmup
-  29: [smoke_test, warmup_aiter_jit, warmup_tunableop]
+  29: [smoke_test, warmup_aiter_jit]
 
   # Phase H: Optimized Wheels
   30: build_rust_wheels
@@ -223,6 +237,9 @@ steps:
   33: clone_and_build_lemonade
   34: install_lemonade_sdk
   35: validate_lemonade
+
+  # Phase J: Backend Smoke Test (all inference backends)
+  36: backend_smoke_test
 
 # =============================================================================
 # Packages: per-component metadata (repos, patches, build notes)
@@ -1305,8 +1322,20 @@ packages:
           with a non-standard block_size.
 
   # ---------------------------------------------------------------------------
-  # Phase G: Validation (no patches -- smoke test only)
+  # Phase G: Build Validation + AITER JIT Pre-warm (no patches)
   # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Phase J: Backend Smoke Test (all inference backends)
+  # ---------------------------------------------------------------------------
+  # Configured in the top-level smoke_test: section.  Downloads a tiny model
+  # (SmolLM2-135M-Instruct) and runs inference through every backend:
+  #   1. vLLM (offline LLM, with TunableOp warmup as side effect)
+  #   2. llama.cpp ROCm (hipBLAS)
+  #   3. llama.cpp Vulkan
+  #   4. Lemonade SDK
+  #   5. Ollama (if installed)
+  # See build-vllm.sh::backend_smoke_test() for implementation.
 
   # ---------------------------------------------------------------------------
   # Phase H: Optimized Wheels

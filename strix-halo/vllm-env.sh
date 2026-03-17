@@ -67,6 +67,46 @@ else
     _AMD_OPT=""
 fi
 
+# ccache: if installed, create a symlink directory that shadows every compiler
+# binary name. Symlinks are more reliable than CC="ccache clang" because they
+# intercept all invocations — cmake, ninja, hipcc, pip, setuptools — regardless
+# of how the build system resolves the compiler. The biggest win is AITER JIT
+# pre-warm: when AITER is rebuilt, all 55 .so files are invalidated and
+# recompiled from scratch. With ccache, those recompiles are cache hits.
+_CCACHE_DIR="${VLLM_DIR}/.ccache/bin"
+if command -v ccache &>/dev/null && [[ -z "${VLLM_NO_CCACHE:-}" ]]; then
+    mkdir -p "${_CCACHE_DIR}"
+    _ccache_bin="$(command -v ccache)"
+
+    # Create symlinks for every compiler name that might be invoked.
+    # ccache resolves the real compiler from CCACHE_PATH or the remainder
+    # of PATH after the symlink directory.
+    for _name in clang clang++ clang-22 \
+                 amdclang amdclang++ \
+                 hipcc hipcc.pl \
+                 gcc g++ cc c++; do
+        if [[ ! -L "${_CCACHE_DIR}/${_name}" ]]; then
+            ln -sf "${_ccache_bin}" "${_CCACHE_DIR}/${_name}"
+        fi
+    done
+    unset _name _ccache_bin
+
+    # Prepend the symlink dir so it shadows the real compilers.
+    export PATH="${_CCACHE_DIR}:${PATH}"
+
+    # CCACHE_BASEDIR normalizes absolute paths to relative, maximizing cache
+    # hits across builds in slightly different directories.
+    export CCACHE_BASEDIR="${VLLM_DIR}"
+
+    # 50 GB cache — HIP object files from AITER and PyTorch are large.
+    export CCACHE_MAXSIZE="50G"
+
+    # Disable ccache for preprocessor-only invocations (cmake compiler probes).
+    # This avoids polluting the cache with tiny throwaway compilations.
+    export CCACHE_NOCPP2=1
+fi
+unset _CCACHE_DIR
+
 # Polly (polyhedral loop optimizer): enabled if the built clang supports it.
 # Polly restructures loop nests for cache locality — critical for Strix Halo's
 # LPDDR5X unified memory hierarchy where cache misses are expensive.
@@ -364,6 +404,13 @@ if [[ "${1:-}" == "--info" ]]; then
     echo "    CXX:              ${CXX}"
     echo "    CFLAGS:           ${CFLAGS}"
     echo "    LDFLAGS:          ${LDFLAGS}"
+    if command -v ccache &>/dev/null && [[ -z "${VLLM_NO_CCACHE:-}" ]]; then
+        echo "    ccache:           active ($(ccache --version | head -1))"
+        echo "    CCACHE_MAXSIZE:   ${CCACHE_MAXSIZE:-default}"
+        echo "    CCACHE_DIR:       ${CCACHE_DIR:-~/.cache/ccache}"
+    else
+        echo "    ccache:           not available"
+    fi
     echo ""
     echo "  GPU / ROCm:"
     echo "    ROCM_ARCH:        ${PYTORCH_ROCM_ARCH}"

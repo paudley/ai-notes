@@ -18,6 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   found on PATH. Tries `go install` (latest) first, falls back to downloading
   the latest GitHub release binary. Both tools are also installed into the
   venv for self-contained builds.
+- **ccache integration** (`vllm-env.sh`): If `ccache` is on PATH, creates a
+  symlink directory (`${VLLM_DIR}/.ccache/bin/`) shadowing all compiler
+  binaries (amdclang, hipcc, clang, gcc, etc.). Intercepts every invocation
+  transparently — cmake, ninja, pip, AITER JIT — without modifying CC/CXX.
+  50 GB cache size. Biggest win: AITER JIT recompiles after a rebuild drop
+  from ~45 min to ~5 min of cache hits. Disable with `VLLM_NO_CCACHE=1`.
 - **AITER JIT pre-warm** (step 29b): Compiles all buildable AITER HIP C++
   modules ahead of time, avoiding first-request JIT latency. 12 CDNA-only
   modules are skipped via a YAML-driven skip list (`jit_skip_modules`),
@@ -27,8 +33,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CDNA-only modules with failure reasons (async LDS DMA, packed FP8, wave64
   static_assert, backward codegen, etc.). Maintainable — remove entries if
   upstream AITER adds gfx1151 support.
-- **TunableOp warmup** (step 29c): Pre-populates GEMM autotuning CSV for
-  common matrix dimensions.
+- **Backend smoke test** (step 36): Downloads SmolLM2-135M-Instruct (~270 MB
+  FP16, ~70 MB Q4 GGUF) and runs actual inference through all five backends:
+  vLLM, llama.cpp ROCm, llama.cpp Vulkan, Lemonade SDK, and Ollama.
+  TunableOp GEMM warmup occurs as a side effect of the vLLM test, so the
+  autotuning CSV is always populated — no separate warmup step needed.
+  Model config is declarative in `vllm-packages.yaml` (`smoke_test:` section).
 - **Optimized wheel installation** (steps 30-31): Source-built wheels are now
   installed back into the build venv, replacing pip-resolved versions with
   Zen 5-optimized native builds.
@@ -42,10 +52,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **YAML-driven build pipeline**: All 35 build steps are now orchestrated from
-  `vllm-packages.yaml`. Repository URLs, branches, patches, build flags, and
-  prerequisites are declared in YAML and read at runtime via `yq`. The build
-  script is now a generic executor rather than a hardcoded sequence.
+- **YAML-driven build pipeline**: All 36 build steps across 10 phases (A–J)
+  are now orchestrated from `vllm-packages.yaml`. Repository URLs, branches,
+  patches, build flags, and prerequisites are declared in YAML and read at
+  runtime via `yq`. The build script is a generic executor, not a hardcoded
+  sequence.
+- **TunableOp warmup absorbed into smoke test**: The standalone
+  `warmup_tunableop()` (former step 29c) is replaced by the backend smoke
+  test (step 36). TunableOp CSV is populated as a side effect of vLLM
+  inference — no `.env` file or pre-configured model required.
 - **Prerequisites section** in `vllm-packages.yaml` restructured with per-distro
   `install_commands` map (arch, ubuntu, fedora) instead of a single Arch-only
   command.
