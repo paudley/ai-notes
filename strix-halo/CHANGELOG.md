@@ -1,0 +1,134 @@
+<!-- Copyright 2026 Blackcat Informatics Inc. -->
+<!-- SPDX-License-Identifier: MIT -->
+
+# Changelog
+
+All notable changes to the Strix Halo vLLM build system are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased]
+
+### Added
+
+- **Multi-distro support**: Auto-detects Arch, Ubuntu/Debian, and Fedora/RHEL
+  via `/etc/os-release` and provides distro-specific prerequisite install
+  commands and kernel package names.
+- **Auto-bootstrapping**: `uv` and `yq` are automatically installed if not
+  found on PATH. Tries `go install` (latest) first, falls back to downloading
+  the latest GitHub release binary. Both tools are also installed into the
+  venv for self-contained builds.
+- **AITER JIT pre-warm** (step 29b): Compiles all buildable AITER HIP C++
+  modules ahead of time, avoiding first-request JIT latency. 12 CDNA-only
+  modules are skipped via a YAML-driven skip list (`jit_skip_modules`),
+  saving ~2.5 hours per build. vLLM uses Triton/PyTorch fallbacks for all
+  skipped modules.
+- **AITER JIT skip list** (`vllm-packages.yaml`): Declarative list of 12
+  CDNA-only modules with failure reasons (async LDS DMA, packed FP8, wave64
+  static_assert, backward codegen, etc.). Maintainable — remove entries if
+  upstream AITER adds gfx1151 support.
+- **TunableOp warmup** (step 29c): Pre-populates GEMM autotuning CSV for
+  common matrix dimensions.
+- **Optimized wheel installation** (steps 30-31): Source-built wheels are now
+  installed back into the build venv, replacing pip-resolved versions with
+  Zen 5-optimized native builds.
+- **Lemonade + llama.cpp** (steps 33-35): Dual-backend llama.cpp build (ROCm
+  hipBLAS + Vulkan) managed by Lemonade SDK, with generated `.env` files for
+  each backend.
+- **`meson`** added to OS prerequisites (required by TheRock's
+  `THEROCK_BUNDLE_SYSDEPS=ON` default).
+- **`common.sh`**: Standalone shared shell helpers (logging, section headers,
+  prerequisite checks) with no external dependencies.
+
+### Changed
+
+- **YAML-driven build pipeline**: All 35 build steps are now orchestrated from
+  `vllm-packages.yaml`. Repository URLs, branches, patches, build flags, and
+  prerequisites are declared in YAML and read at runtime via `yq`. The build
+  script is now a generic executor rather than a hardcoded sequence.
+- **Prerequisites section** in `vllm-packages.yaml` restructured with per-distro
+  `install_commands` map (arch, ubuntu, fedora) instead of a single Arch-only
+  command.
+- **`bootstrap_yq()`** no longer hardcodes a version. Uses `go install
+  github.com/mikefarah/yq/v4@latest` when Go is available, otherwise fetches
+  the latest release tag from the GitHub API.
+- **All wheels are mandatory**: Steps 30-32 now `die` on any wheel build
+  failure instead of falling back to PyPI binaries. Step 32 verifies all 13
+  required wheels are present before completing.
+- **Old wheels auto-pruned**: `prune_old_wheels()` removes stale versions
+  from `wheels/` after each build, preventing duplicate accumulation across
+  rebuilds (e.g., two amd-aiter or two vllm wheels from successive runs).
+
+### Fixed
+
+- **Triton stdout pollution** (BUILD-FIXES.md #55): `triton.experimental.gluon`
+  warning printed to stdout (not stderr) corrupted `jit_dir` variable capture,
+  causing the build script to die after AITER pre-warm instead of continuing to
+  steps 30-35. Fixed by piping through `tail -1` on all three capture sites.
+- **Flash Attention internal AITER install** (BUILD-FIXES.md #52): Flash
+  Attention's `setup.py` tried to `pip install third_party/aiter` which fails
+  on gfx1151 (missing gfx942 `.co` files). Patched to skip — we build AITER
+  separately.
+- **AITER JIT SystemExit propagation** (BUILD-FIXES.md #53): `SystemExit`
+  (inherits `BaseException`, not `Exception`) from failed module builds
+  propagated through the warmup script. Changed handler to catch
+  `(Exception, SystemExit)`.
+- **Optimized wheels not in venv** (BUILD-FIXES.md #54): Steps 30-31 built
+  wheels but never installed them. Added `uv pip install --force-reinstall`
+  after each wheel build.
+- **FP8 linear crash on gfx1x** (BUILD-FIXES.md #37): CK GEMM FP8 kernels
+  use CDNA MFMA instructions. Added gfx1x guard to fall through to Triton
+  blockscale GEMM.
+- **`+rms_norm` custom_ops graph partition bug** (BUILD-FIXES.md #40): Declaring
+  RMSNorm as opaque custom op caused Inductor to generate incorrect code at
+  partition boundaries on wave32. This was the single biggest fix: 7.7-8.9x
+  speedup (137 -> 1060 tok/s on Qwen2.5-0.5B).
+- **Duplicate pattern registration crash** (BUILD-FIXES.md #39): AITER fusion
+  pass registered identical patterns, fixed with `skip_duplicates=True`.
+- **Triton sampler page fault** (BUILD-FIXES.md #41): Triton top-k/top-p kernel
+  page-faults on gfx1151 after torch.compile AOT. Bypassed to PyTorch
+  sort-based path.
+- **FLA autotuner page faults** (BUILD-FIXES.md #42, #49): Restricted AMD
+  autotuning to `num_stages=2`, `BV=32` to stay within RDNA 3.5 register
+  pressure limits.
+- **Qwen3.5 FLA warmup page fault** (BUILD-FIXES.md #43): Restricted warmup
+  loop to `T=64` only (T < BT page-faults on wave32).
+- **KV cache block_size mismatch** (BUILD-FIXES.md #50): Hybrid model alignment
+  clobbered by ROCm platform config. Fixed sequencing and constraint propagation.
+- **AITER unified attention non-power-of-2 block_size** (BUILD-FIXES.md #51):
+  Added power-of-2 constraint and TILE_SIZE cap for hybrid models.
+
+## [0.2.0] - 2026-03-15
+
+### Added
+
+- **AITER source rebuild** (step 28b): Rebuilds AITER from PyTorch submodule
+  source with matching CK headers, eliminating ABI mismatches from pip wheel.
+- **FLA patches** (patches 11-16, 20-28): Flash Linear Attention fixes for
+  Qwen3.5 hybrid model support on RDNA 3.5.
+- **`vllm-packages.yaml`**: Package manifest with all repos, branches, patches,
+  and build metadata in a single declarative file.
+- Qwen3.5-0.8B MoE benchmark: 285.5 tok/s with FLA + hybrid model patches.
+
+### Changed
+
+- AITER gfx1x gate extended to cover attention, GEMM, and normalization
+  (patches 2-5).
+- ViT attention reverted to gfx9-only (patch 6) — CK fmha_fwd rejects ViT
+  dimensions on gfx1151.
+
+## [0.1.0] - 2026-03-12
+
+### Added
+
+- Initial 32-step build pipeline across 8 phases.
+- 29 documented build fixes with root cause analysis.
+- `build-vllm.sh`: Master build script.
+- `vllm-env.sh`: Environment activation with compiler flags for Zen 5 + RDNA 3.5.
+- `vllm-start.sh`, `vllm-stop.sh`, `vllm-status.sh`: Runtime management.
+- Benchmark results: 1059.8 tok/s (Qwen2.5-0.5B), 391.6 tok/s (Qwen2.5-1.5B).
+- 13 optimized wheel packages (torch, triton, vllm, numpy, etc.).
+
+[Unreleased]: https://github.com/blackcat-informatics/ai-notes/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/blackcat-informatics/ai-notes/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/blackcat-informatics/ai-notes/releases/tag/v0.1.0

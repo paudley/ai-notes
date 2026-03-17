@@ -641,6 +641,69 @@ the Triton RMSNorm from `aiter.ops.triton.normalization.rmsnorm` (which
 generates correct wave32 kernels). On gfx9 (CDNA), use the original CK path
 with the `use_model_sensitive_rmsnorm=0` kwarg.
 
+### 52. Flash Attention internal AITER install failure (Step 28)
+
+**Symptom**: Flash Attention build fails with `error: [Errno 2] No such file
+or directory: 'aiter_meta/hsa/gfx942/fmoe_2stages/...'`.
+
+**Root cause**: Flash Attention's `setup.py` (ROCm `main_perf` branch) runs
+`subprocess.run([sys.executable, "-m", "pip", "install", "--no-build-isolation",
+"third_party/aiter"])` during the build. This AITER submodule bundles
+pre-compiled `.co` (code object) files for gfx942 only. On gfx1151 the gfx942
+code objects are missing from the source tree, causing `FileNotFoundError`
+during `setup.py`'s `package_data` collection.
+
+**Fix**: Patch `setup.py` to replace the `subprocess.run(pip install aiter)`
+call with `pass`. We build AITER separately from the PyTorch submodule source
+(step 28b) with proper gfx1151 patches, so the flash_attn internal install
+is unnecessary and harmful.
+
+### 53. AITER JIT pre-warm SystemExit propagation (Step 29b)
+
+**Symptom**: Build script exits non-zero during AITER JIT pre-warm when any
+module fails to compile, killing subsequent build steps.
+
+**Root cause**: AITER's `build_module()` function (`aiter/jit/core.py:694`)
+raises `SystemExit` on compilation failure. `SystemExit` inherits from
+`BaseException`, not `Exception`, so the warmup script's `except Exception`
+clause doesn't catch it. The `SystemExit` propagates out of the Python
+interpreter, making it exit non-zero.
+
+**Fix**: Change the warmup script's exception handler from `except Exception`
+to `except (Exception, SystemExit)`. Expected failures (CDNA-only modules like
+`module_activation`, `module_quick_all_reduce`, `module_moe_asm`) are caught,
+counted, and logged without terminating the build.
+
+### 54. Optimized wheels not installed into venv (Steps 30-31)
+
+**Symptom**: After build completes, the venv has pip-resolved versions of
+numpy (2.1.3), and lacks orjson and asyncpg entirely, despite Zen 5-optimized
+wheels being present in `wheels/`.
+
+**Root cause**: Steps 30-31 build optimized wheels into `wheels/` but never
+install them back into the build venv. The wheels were only intended for
+distribution to other environments.
+
+**Fix**: Add `uv pip install --force-reinstall --no-deps <wheel>` after each
+wheel is built (or confirmed to exist). This replaces the venv's
+pip-installed versions with the source-built, Zen 5-optimized versions.
+
+### 55. Triton stdout pollution breaks AITER JIT directory capture (Step 29b)
+
+**Error**: After AITER JIT pre-warm completes, the build script dies with exit
+code 1 instead of continuing to steps 30-35.
+
+**Root cause**: `get_user_jit_dir()` imports triton, which prints a warning to
+**stdout** (not stderr): `Warning: triton.experimental.gluon or
+triton.experimental.gluon.language not exists...`. The bash `$(...)` captures
+this warning along with the actual JIT directory path, creating a multi-line
+`jit_dir` variable. When `find "${jit_dir}" -maxdepth 1 ...` runs, the garbage
+path causes `find` to fail, and `set -euo pipefail` kills the script.
+
+**Fix**: Pipe the `get_user_jit_dir()` output through `tail -1` to grab only
+the last line (the actual path), discarding any stdout pollution from upstream
+imports. Applied to all three `jit_dir` capture sites (lines 2372, 3037, 3204).
+
 ## AITER Source Rebuild (Phase F, Step 28b)
 
 ### 46. AITER CK ABI mismatch

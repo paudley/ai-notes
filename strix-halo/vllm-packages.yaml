@@ -99,18 +99,18 @@ build:
 # =============================================================================
 
 prerequisites:
-  # Commands that must be on PATH (checked by require_commands)
+  # Commands that must be on PATH (checked by require_commands).
+  # uv and yq are NOT listed here — they are bootstrapped automatically
+  # if missing (see bootstrap_tools in build-vllm.sh).
   required_commands:
     - clang
     - clang++
     - lld
     - cmake
     - ninja
-    - uv
     - git
     - curl
     - python3
-    - yq
   # Additional build tools (checked individually with actionable errors)
   build_tools:
     - gfortran
@@ -121,13 +121,43 @@ prerequisites:
     - flex
     - xxd
     - scons
-  # Package install command for CachyOS / Arch Linux
-  install_command: >
-    sudo pacman -S clang lld cmake ninja git curl uv go-yq
-    gcc-fortran patchelf automake libtool bison flex xxd scons
-    vulkan-devel vulkan-radeon
-  # Kernel package for gfx1151 support
-  kernel_package: "linux-cachyos-rc linux-cachyos-rc-headers"
+    - meson
+  # Tools that are auto-bootstrapped to LOCAL_PREFIX/bin if not on PATH.
+  # Also installed into the venv for self-contained builds.
+  bootstrap:
+    uv:
+      version: "0.7.12"
+      url_template: "https://github.com/astral-sh/uv/releases/download/{version}/uv-{arch}-unknown-linux-gnu.tar.gz"
+    yq:
+      # Version is auto-detected: go install (latest) or GitHub API latest release.
+      # url_template is only used as fallback when Go is not installed.
+      url_template: "https://github.com/mikefarah/yq/releases/download/v{version}/yq_linux_{goarch}"
+
+  # Per-distro package install commands. Keyed by /etc/os-release ID or
+  # ID_LIKE family. The script auto-detects the distro at runtime.
+  install_commands:
+    arch:
+      packages: >
+        sudo pacman -S clang lld cmake ninja git curl
+        gcc-fortran patchelf automake libtool bison flex xxd scons meson
+        vulkan-devel vulkan-radeon
+      kernel: "linux-cachyos-rc linux-cachyos-rc-headers"
+      notes: "uv and yq (go-yq) available via pacman: sudo pacman -S uv go-yq"
+    ubuntu:
+      packages: >
+        sudo apt-get install -y clang lld cmake ninja-build git curl
+        gfortran patchelf automake libtool bison flex xxd scons meson
+        libvulkan-dev mesa-vulkan-drivers python3-dev
+      kernel: "linux-headers-$(uname -r)"
+      notes: "uv and yq are auto-bootstrapped (not in apt repos)"
+    fedora:
+      packages: >
+        sudo dnf install -y clang lld cmake ninja-build git curl
+        gcc-gfortran patchelf automake libtool bison flex vim-common scons meson
+        vulkan-devel mesa-vulkan-drivers python3-devel
+      kernel: "kernel-devel"
+      notes: "uv and yq are auto-bootstrapped (not in dnf repos)"
+
   # Device nodes that must exist
   device_nodes:
     - /dev/kfd
@@ -845,17 +875,10 @@ packages:
           must fall through to TRITON_ATTN on RDNA 3.5.
 
       # 7. FP8 linear: disable AITER CK GEMM on gfx1x
-      - type: sed
+      - type: file_rewrite
         file: "vllm/_aiter_ops.py"
-        marker: "from vllm.platforms.rocm import on_gfx1x"
+        marker: "# RDNA 3.5 (gfx1x): CK GEMM kernels crash with GPU page faults"
         marker_absent: true
-        sed_command: >
-          /def is_linear_fp8_enabled(cls) -> bool:/{n;s|return cls.is_linear_enabled()|
-          # RDNA 3.5 (gfx1x): CK GEMM kernels crash with GPU page faults
-          from vllm.platforms.rocm import on_gfx1x\n
-          if on_gfx1x():\n
-              return False\n
-          return cls.is_linear_enabled()|}
         description: >
           Disable AITER FP8 linear layer (gemm_a8w8_blockscale) on gfx1x.
           CK GEMM kernels compile successfully via JIT but crash at runtime
@@ -865,6 +888,7 @@ packages:
           With this disabled, vLLM falls through to its Triton GEMM
           blockscale implementation (w8a8_triton_block_scaled_mm_func)
           which uses pure Triton and works on all architectures.
+        note: "Content is inline Python in build-vllm.sh (multi-line replacement)"
 
       # 8. Block +rms_norm custom_ops on gfx1x (Inductor codegen bug)
       - type: sed
@@ -1173,6 +1197,18 @@ packages:
           Prepend "import amdsmi" before any torch imports. Same C extension
           conflict as vLLM -- amdsmi must be loaded first.
 
+      # 2. Skip internal AITER install (we build AITER separately in step 28b)
+      - type: file_rewrite
+        file: "setup.py"
+        marker: "# PATCHED: skip aiter install"
+        marker_absent: true
+        description: >
+          Flash Attention's setup.py runs pip install third_party/aiter which
+          bundles pre-compiled gfx942 code objects that fail on gfx1151. Since
+          we build AITER separately from PyTorch's submodule (step 28b) with
+          gfx1151 patches, skip the flash_attn internal install.
+        note: "Content is inline Python in build-vllm.sh (replaces aiter install block)"
+
   aiter:
     repo: "https://github.com/ROCm/aiter.git"
     src_dir: "pytorch/third_party/aiter"
@@ -1184,6 +1220,22 @@ packages:
     skip_marker: null
     environment:
       PREBUILD_KERNELS: "0"
+    # Modules that use CDNA-only ISA and cannot compile on RDNA 3.5 (gfx1151).
+    # Skipped during JIT pre-warm to avoid wasting hours on guaranteed failures.
+    # vLLM has Triton/PyTorch fallback paths for all of these.
+    jit_skip_modules:
+      - module_activation         # v_pk_mul_f32 (CDNA packed FP32 multiply)
+      - module_quick_all_reduce   # CDNA collective ops
+      - module_moe_asm            # s_bitcmp1_b32 (CDNA scalar bit compare)
+      - module_mha_bwd            # missing asm_fmha_v3_bwd_configs.hpp (backward codegen targets gfx9xx only)
+      - module_mha_varlen_bwd     # same missing backward configs header
+      - module_mha_batch_prefill  # buffer_load_dword...lds (CDNA async LDS DMA)
+      - libmha_fwd                # buffer_load_dword...lds (CDNA async LDS DMA)
+      - libmha_bwd                # backward + async LDS
+      - module_topk_plain         # static_assert(size >= 2 * get_warp_size()) assumes wave64
+      - module_cache              # CDNA-specific cache ops
+      - module_deepgemm           # CDNA MFMA instructions
+      - module_gemm_a8w8_bpreshuffle_cktile  # CDNA block-scaled GEMM
     aiter_support: |
       AITER's Python layer fully recognizes gfx1151 (chip_info.py enum 13,
       _aiter_ops.py on_gfx1x() check). However the CUDA/HIP kernel sources
@@ -1266,7 +1318,7 @@ packages:
     steps: [30]
     depends_on: [cpython]
     notes: |
-      Builds orjson and cryptography from source with Rust flags:
+      Builds and installs orjson and cryptography from source with Rust flags:
         RUSTFLAGS="-C target-cpu=znver5 -C opt-level=3"
       This enables full AVX-512 + VAES codegen for Zen 5.
 
@@ -1287,8 +1339,8 @@ packages:
     steps: [31]
     depends_on: [cpython, pytorch]
     notes: |
-      Builds numpy, sentencepiece, zstandard, asyncpg from source with
-      Zen 5 optimization flags.
+      Builds and installs numpy, sentencepiece, zstandard, asyncpg from
+      source with Zen 5 optimization flags.
 
       numpy: cmake pip wrapper breaks in build isolation; replaced with
       symlink to system cmake.
