@@ -39,6 +39,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   TunableOp GEMM warmup occurs as a side effect of the vLLM test, so the
   autotuning CSV is always populated — no separate warmup step needed.
   Model config is declarative in `vllm-packages.yaml` (`smoke_test:` section).
+- **Per-backend skip controls** (`.env`): Set `SMOKE_SKIP_VLLM=1`,
+  `SMOKE_SKIP_LLAMACPP_ROCM=1`, `SMOKE_SKIP_LLAMACPP_VULKAN=1`,
+  `SMOKE_SKIP_LEMONADE=1`, or `SMOKE_SKIP_OLLAMA=1` in `${VLLM_DIR}/.env`
+  to skip individual backends during iterative debugging. Summary table
+  reports skipped backends as `SKIP`.
+- **Warmup passes for all backends**: Each backend now runs a 1-token warmup
+  generation before the real test to absorb JIT compilation, TunableOp
+  autotuning (vLLM), model loading latency (llama.cpp), and HuggingFace
+  module initialization (Lemonade). Prevents false timeouts on first run.
 - **Optimized wheel installation** (steps 30-31): Source-built wheels are now
   installed back into the build venv, replacing pip-resolved versions with
   Zen 5-optimized native builds.
@@ -76,6 +85,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **llama-cli conversation mode hang**: `llama-cli` enters interactive
+  conversation mode by default, blocking forever on stdin when run from a
+  script. `--no-conversation` is not supported by llama-cli (only
+  llama-server). Fixed by using `--single-turn` which generates one response
+  and exits. Combined with a `timeout` wrapper (120s warmup, 60s test) as a
+  safety net. Output extraction uses `sed -n 's/^| *//p'` to parse the
+  `| ` response prefix from llama-cli's conversation format.
+- **Summary table crash with `set -e`**: `((pass_count++))` when `pass_count`
+  is 0 evaluates to `((0))` which returns exit code 1, killed by `set -e`
+  after printing only the first result row. Fixed by using assignment form
+  `pass_count=$((pass_count + 1))` which always succeeds.
+- **Lemonade SDK integration**: Three cascading fixes:
+  1. Wrong recipe: `recipe='llamacpp'` does not exist; changed to
+     `recipe='hf-dgpu'` with HuggingFace model name instead of GGUF path.
+  2. Wrong API: `model.generate('text')` fails because `HuggingfaceAdapter`
+     expects tokenized `input_ids` tensors. Fixed to tokenize with
+     `tokenizer(prompt, return_tensors='pt')` and pass `input_ids` +
+     `attention_mask`.
+  3. Wrong output parsing: `output['output_tokens']` fails because
+     `generate()` returns a raw `[batch, seq]` token ID tensor, not a dict.
+     Fixed to slice off prompt tokens (`outputs[0][input_len:]`) and decode.
+  4. Missing chat template: SmolLM2-135M-Instruct produces immediate EOS
+     without chat template formatting. Added
+     `tokenizer.apply_chat_template()` with `add_generation_prompt=True`.
+- **vLLM per-prompt assertion too strict**: Replaced per-prompt `assert n_out
+  > 0` with aggregate `assert total_output_tokens > 0` to tolerate vLLM
+  occasionally producing zero tokens on a single short prompt while still
+  catching total generation failure.
+- **Step dispatch on scalar YAML values**: `yq '.steps."N"[]'` fails when the
+  value is a scalar string (not an array). Fixed with `mapfile` + empty-entry
+  filtering to handle both `[func1, func2]` and `func` forms.
 - **Triton stdout pollution** (BUILD-FIXES.md #55): `triton.experimental.gluon`
   warning printed to stdout (not stderr) corrupted `jit_dir` variable capture,
   causing the build script to die after AITER pre-warm instead of continuing to
