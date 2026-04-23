@@ -67,7 +67,7 @@
 #
 #   Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
 #    30. Build Rust wheels      (orjson, cryptography — AVX-512 + VAES)
-#    31. Build C/C++ wheels     (numpy, sentencepiece, zstandard, asyncpg)
+#    31. Build C/C++ wheels     (numpy, sentencepiece, zstandard, asyncpg, duckdb)
 #    32. Export source wheels    (torch, triton, torchvision, amd-aiter, amdsmi)
 #
 #   Phase I: Lemonade Inference Server (llama.cpp + FLM + ONNX)
@@ -554,22 +554,30 @@ clone_pkg() {
             fi
         fi
 
-        # Fetch and update
-        local pull_branch="${branch:-$(git branch --show-current)}"
-        git fetch origin "${pull_branch}"
-
-        # Switch branches if needed
+        # Update only the top-level repo here. Recursive pulls respect user git
+        # config (e.g. pull.rebase=true, submodule.recurse=true) and can leave
+        # dependency submodules in conflicted rebases. We sync submodules
+        # explicitly below after the superproject is updated.
         local current_branch
         current_branch="$(git branch --show-current)"
+        local pull_branch="${branch:-${current_branch}}"
+        if [[ -z "${pull_branch}" ]]; then
+            die "Cannot update ${description}: repository is detached HEAD and no branch is configured."
+        fi
+        git -c submodule.recurse=false fetch --no-recurse-submodules origin "${pull_branch}"
+
+        # Switch branches if needed
         if [[ -n "${branch}" && "${current_branch}" != "${branch}" ]]; then
             info "Switching to ${branch} branch..."
             git checkout "${branch}"
         fi
-        git pull origin "${pull_branch}"
+        git -c pull.rebase=false -c submodule.recurse=false \
+            pull --ff-only --no-recurse-submodules origin "${pull_branch}"
 
         # Update submodules if recursive
         if [[ "${is_recursive}" == "true" ]]; then
             info "Updating submodules..."
+            git submodule sync --recursive
             git submodule update --init --recursive
         fi
 
@@ -3421,6 +3429,37 @@ warmup_aiter_jit() {
     fi
     info "AITER JIT directory: ${jit_dir}"
 
+    # AITER uses PyTorch's FileBaton, which waits forever if a prior run
+    # crashed and left lock_* files behind. Clear any dead baton files before
+    # starting the serial pre-warm loop.
+    local jit_build_dir="${jit_dir}/build"
+    if [[ -d "${jit_build_dir}" ]]; then
+        local -a stale_jit_locks=()
+        local _lock_path=""
+        while IFS= read -r -d '' _lock_path; do
+            if command -v lsof >/dev/null 2>&1; then
+                if lsof -t -- "${_lock_path}" >/dev/null 2>&1; then
+                    continue
+                fi
+            elif command -v fuser >/dev/null 2>&1; then
+                if fuser "${_lock_path}" >/dev/null 2>&1; then
+                    continue
+                fi
+            fi
+            stale_jit_locks+=("${_lock_path}")
+        done < <(
+            find "${jit_build_dir}" -type f \
+                \( -name 'lock_*' -o -name 'lock' \) \
+                -print0 2>/dev/null
+        )
+
+        if (( ${#stale_jit_locks[@]} > 0 )); then
+            warn "Removing ${#stale_jit_locks[@]} stale AITER JIT lock files"
+            printf '  stale lock: %s\n' "${stale_jit_locks[@]}"
+            rm -f -- "${stale_jit_locks[@]}"
+        fi
+    fi
+
     # Read the CDNA-only skip list from YAML. These modules use ISA instructions
     # that don't exist on RDNA 3.5 and will never compile on gfx1151. Skipping
     # them avoids wasting ~2.5 hours on guaranteed failures (module_mha_bwd and
@@ -3681,8 +3720,8 @@ print('PASS')
         # Warmup: first run loads model weights and initializes GPU buffers
         info "  Warmup pass..."
         timeout 120 "${LLAMACPP_INSTALL_DIR}/llama-cli" \
-            -m "${gguf_path}" -p "warmup" -n 1 --no-display-prompt --single-turn -ngl 99 \
-            >/dev/null 2>&1 || true
+            -m "${gguf_path}" -p "warmup" -n 1 --no-display-prompt --single-turn --simple-io -ngl 99 \
+            </dev/null >/dev/null 2>&1 || true
         local _rocm_output
         if _rocm_output="$(timeout 60 "${LLAMACPP_INSTALL_DIR}/llama-cli" \
             -m "${gguf_path}" \
@@ -3690,10 +3729,19 @@ print('PASS')
             -n "${max_tokens}" \
             --no-display-prompt \
             --single-turn \
+            --simple-io \
             -ngl 99 \
+            </dev/null \
             2>/dev/null)"; then
-            # Extract model response: line starting with "| " (llama-cli conversation format)
-            _rocm_output="$(echo "${_rocm_output}" | sed -n 's/^| *//p' | tr -d '\n' | head -c 200)"
+            # In PTY-backed runs llama-cli may still emit banner and prompt text; isolate
+            # the assistant reply between the prompt line and trailing perf footer.
+            _rocm_output="$(printf '%s\n' "${_rocm_output}" | tr -d '\r\010' | awk '
+BEGIN { capture=0 }
+/^> / { capture=1; next }
+/^\[ Prompt:/ { capture=0 }
+/^Exiting\.\.\.$/ { capture=0 }
+capture { print }
+' | sed '/^[[:space:]]*$/d' | tr '\n' ' ' | head -c 200)"
             if [[ -n "${_rocm_output}" ]]; then
                 results[llamacpp_rocm]="PASS"
                 success "llama.cpp ROCm: PASS"
@@ -3725,8 +3773,8 @@ print('PASS')
         # Warmup: first run loads model weights and initializes Vulkan resources
         info "  Warmup pass..."
         timeout 120 "${LLAMACPP_VULKAN_DIR}/llama-cli" \
-            -m "${gguf_path}" -p "warmup" -n 1 --no-display-prompt --single-turn -ngl 99 \
-            >/dev/null 2>&1 || true
+            -m "${gguf_path}" -p "warmup" -n 1 --no-display-prompt --single-turn --simple-io -ngl 99 \
+            </dev/null >/dev/null 2>&1 || true
         local _vulkan_output
         if _vulkan_output="$(timeout 60 "${LLAMACPP_VULKAN_DIR}/llama-cli" \
             -m "${gguf_path}" \
@@ -3734,10 +3782,17 @@ print('PASS')
             -n "${max_tokens}" \
             --no-display-prompt \
             --single-turn \
+            --simple-io \
             -ngl 99 \
+            </dev/null \
             2>/dev/null)"; then
-            # Extract model response: line starting with "| " (llama-cli conversation format)
-            _vulkan_output="$(echo "${_vulkan_output}" | sed -n 's/^| *//p' | tr -d '\n' | head -c 200)"
+            _vulkan_output="$(printf '%s\n' "${_vulkan_output}" | tr -d '\r\010' | awk '
+BEGIN { capture=0 }
+/^> / { capture=1; next }
+/^\[ Prompt:/ { capture=0 }
+/^Exiting\.\.\.$/ { capture=0 }
+capture { print }
+' | sed '/^[[:space:]]*$/d' | tr '\n' ' ' | head -c 200)"
             if [[ -n "${_vulkan_output}" ]]; then
                 results[llamacpp_vulkan]="PASS"
                 success "llama.cpp Vulkan: PASS"
@@ -3983,7 +4038,7 @@ build_rust_wheels() {
 
 # Step 31: Build C/C++ optimized wheels
 build_native_wheels() {
-    log_step 31 "Build C/C++ optimized wheels (numpy, sentencepiece, zstandard, asyncpg)"
+    log_step 31 "Build C/C++ optimized wheels (numpy, sentencepiece, zstandard, asyncpg, duckdb)"
 
     mkdir -p "${WHEELS_DIR}"
 
@@ -4028,6 +4083,7 @@ build_native_wheels() {
     #   sentencepiece: Tokenizer hot path for every model inference call
     #   zstandard:    Zstd compression with AVX-512 VAES paths (JSONL streaming)
     #   asyncpg:      PostgreSQL wire protocol, every DB call
+    #   duckdb:       Embedded OLAP engine for local analytics and parquet scans
     # Excluded:
     #   pyzstd — now pure Python (C extension moved to backports-zstd), and
     #     redundant since zstandard covers the same use case (PyTorch checkpoint
@@ -4041,6 +4097,7 @@ build_native_wheels() {
         "sentencepiece"
         "zstandard"
         "asyncpg"
+        "duckdb"
     )
 
     for _pkg in "${_packages[@]}"; do
@@ -4185,7 +4242,7 @@ export_source_wheels() {
     [[ -n "${_fa_wheel}" ]] || die "flash_attn wheel missing from ${WHEELS_DIR} — run step 28 first"
     success "flash_attn wheel exists: $(basename "${_fa_wheel}")"
 
-    # Summary — verify all 13 packages are present
+    # Summary — verify all 14 packages are present
     local _wheel_count
     _wheel_count="$(compgen -G "${WHEELS_DIR}/*.whl" | wc -l)"
     echo ""
@@ -4194,8 +4251,8 @@ export_source_wheels() {
         [[ -f "${_whl}" ]] || continue
         info "  $(basename "${_whl}")"
     done
-    if [[ "${_wheel_count}" -lt 13 ]]; then
-        die "Expected at least 13 wheels, found ${_wheel_count}. Check build log for failures."
+    if [[ "${_wheel_count}" -lt 14 ]]; then
+        die "Expected at least 14 wheels, found ${_wheel_count}. Check build log for failures."
     fi
 
     success "Source wheel export complete — all ${_wheel_count} wheels verified"

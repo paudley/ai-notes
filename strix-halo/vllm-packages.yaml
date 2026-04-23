@@ -1368,7 +1368,7 @@ packages:
     steps: [31]
     depends_on: [cpython, pytorch]
     notes: |
-      Builds and installs numpy, sentencepiece, zstandard, asyncpg from
+      Builds and installs numpy, sentencepiece, zstandard, asyncpg, duckdb from
       source with Zen 5 optimization flags.
 
       numpy: cmake pip wrapper breaks in build isolation; replaced with
@@ -1409,6 +1409,7 @@ packages:
 
   llamacpp:
     repo: "https://github.com/ggml-org/llama.cpp.git"
+    branch: "master"
     src_dir: "llama.cpp"
     shallow: true
     method: cmake
@@ -1446,6 +1447,10 @@ packages:
       - llama-quantize
     notes: |
       llama.cpp built with TWO backends for Lemonade:
+
+      Source branch: upstream master. APEX GGUF support is expected on current
+      upstream HEAD, so step 33 should build plain ggml-org/llama.cpp rather
+      than a stale local "head-apex" side branch.
 
       ROCm (hipBLAS): Primary backend. Best prefill <32K context. Uses
       amdclang from TheRock with full Zen 5 + gfx1151 HIP optimization
