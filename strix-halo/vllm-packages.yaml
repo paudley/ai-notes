@@ -1638,6 +1638,8 @@ packages:
         cmake_flags:
           GGML_HIP: "ON"
           AMDGPU_TARGETS: "gfx1151"
+          GGML_LTO: "ON"
+          LLAMA_BUILD_WEBUI: "OFF"
         hip_flags: "--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
         env:
           HSA_OVERRIDE_GFX_VERSION: "11.5.1"
@@ -1650,6 +1652,11 @@ packages:
         build_dir: "build-vulkan"
         cmake_flags:
           GGML_VULKAN: "ON"
+          GGML_LTO: "ON"
+          GGML_VULKAN_CHECK_RESULTS: "OFF"
+          GGML_VULKAN_VALIDATE: "OFF"
+          GGML_VULKAN_DEBUG: "OFF"
+          LLAMA_BUILD_WEBUI: "OFF"
         env:
           LLAMA_ARG_BATCH: "2048"
           LLAMA_ARG_UBATCH: "2048"
@@ -1667,11 +1674,13 @@ packages:
 
       ROCm (hipBLAS): Primary backend. Best prefill <32K context. Uses
       amdclang from TheRock with full Zen 5 + gfx1151 HIP optimization
-      flags. Binaries placed where Lemonade SDK expects them.
+      flags, explicit ggml LTO, and no embedded server web UI. Binaries placed
+      where Lemonade SDK expects them.
 
       Vulkan: Secondary backend. +22% generation speed (44 vs 39 tok/s)
       and handles >32K context prefill (no VMM limitation on gfx1151).
-      CPU-only optimization flags, no HIP offload.
+      Uses the same amdclang, Zen 5, ThinLTO, AOCL-LibM, and Vulkan
+      release-mode settings as the stable-diffusion.cpp Vulkan build.
 
       Both backends get .env files with gfx1151 runtime optimizations
       (batch sizing, hipBLASLt, THP). RPATH patched via patchelf so
@@ -1737,6 +1746,7 @@ packages:
         SD_WEBP: "ON"
         SD_WEBM: "ON"
         GGML_NATIVE: "ON"
+        GGML_LTO: "ON"
         GGML_OPENMP: "ON"
         GGML_CCACHE: "ON"
         GGML_VULKAN_CHECK_RESULTS: "OFF"

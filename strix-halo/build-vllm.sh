@@ -4913,6 +4913,7 @@ clone_and_build_lemonade() {
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HIP=ON \
             -DAMDGPU_TARGETS="gfx1151" \
+            -DGGML_LTO=ON \
             -DCMAKE_C_COMPILER="${_cc}" \
             -DCMAKE_CXX_COMPILER="${_cxx}" \
             -DCMAKE_HIP_COMPILER="${_cxx}" \
@@ -4924,6 +4925,7 @@ clone_and_build_lemonade() {
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_WEBUI=OFF \
             -DCMAKE_INSTALL_PREFIX="${LLAMACPP_INSTALL_DIR}"
 
         cmake --build "${_build_dir}" --config Release -j "$(nproc)"
@@ -5001,17 +5003,39 @@ clone_and_build_lemonade() {
     else
         info "Building llama.cpp with Vulkan backend..."
 
+        local _vulkan_cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+        local _vulkan_cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
+
+        local _vulkan_cpu_flags
+        if [[ ! -x "${_vulkan_cc}" ]]; then
+            warn "TheRock amdclang not found at ${_vulkan_cc}, falling back to system clang"
+            _vulkan_cc="clang"
+            _vulkan_cxx="clang++"
+            _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -Wno-error=unused-command-line-argument"
+        else
+            _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+        fi
+
+        local _vulkan_link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
+
         cmake -B "${_vulkan_build_dir}" -S "${LLAMACPP_SRC}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_VULKAN=ON \
-            -DCMAKE_C_FLAGS_RELEASE="-O3 -march=native -flto=thin -mprefer-vector-width=512" \
-            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native -flto=thin -mprefer-vector-width=512" \
-            -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DGGML_LTO=ON \
+            -DGGML_VULKAN_CHECK_RESULTS=OFF \
+            -DGGML_VULKAN_VALIDATE=OFF \
+            -DGGML_VULKAN_DEBUG=OFF \
+            -DCMAKE_C_COMPILER="${_vulkan_cc}" \
+            -DCMAKE_CXX_COMPILER="${_vulkan_cxx}" \
+            -DCMAKE_C_FLAGS="${_vulkan_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS="${_vulkan_cpu_flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${_vulkan_link_flags}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${_vulkan_link_flags}" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_WEBUI=OFF
 
         cmake --build "${_vulkan_build_dir}" --config Release -j "$(nproc)"
         success "llama.cpp Vulkan build complete"
@@ -5042,9 +5066,9 @@ clone_and_build_lemonade() {
     if command -v patchelf >/dev/null 2>&1; then
         for _bin in "${_binaries[@]}"; do
             [[ -x "${LLAMACPP_VULKAN_DIR}/${_bin}" ]] || continue
-            patchelf --set-rpath "${LLAMACPP_VULKAN_DIR}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
+            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${LLAMACPP_VULKAN_DIR}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
         done
-        info "RPATH fixed for Vulkan binaries -> ${LLAMACPP_VULKAN_DIR}"
+        info "RPATH fixed for Vulkan binaries -> ${LOCAL_PREFIX}/lib:${LLAMACPP_VULKAN_DIR}"
     fi
 
     # Version tracking for Vulkan backend
@@ -5103,6 +5127,7 @@ clone_and_build_stable_diffusion() {
             -DSD_WEBP=ON \
             -DSD_WEBM=ON \
             -DGGML_NATIVE=ON \
+            -DGGML_LTO=ON \
             -DGGML_OPENMP=ON \
             -DGGML_CCACHE=ON \
             -DGGML_VULKAN_CHECK_RESULTS=OFF \
