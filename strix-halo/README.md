@@ -137,7 +137,11 @@ two GPU backends, managed by the
 | Backend | Best For | Notes |
 |---------|----------|-------|
 | **ROCm** (hipBLAS) | Prefill < 32K context | Primary backend, uses amdclang + gfx1151 HIP flags |
-| **Vulkan** | Generation speed, prefill > 32K | +22% tok/s generation, no 32K VMM limitation |
+| **Vulkan** | Generation speed, prefill > 32K | amdclang + Zen 5 flags, +22% tok/s generation, no 32K VMM limitation |
+
+Both builds use TheRock `amdclang`, Zen 5 native CPU flags, ThinLTO/ggml LTO,
+and omit the embedded llama-server web UI. The Vulkan build also links against
+AOCL-LibM and keeps Vulkan validation/debug checks disabled for release use.
 
 Both backends are installed into the venv and Lemonade can route between
 them based on workload. Each backend gets its own `.env` file with
@@ -148,7 +152,7 @@ gfx1151 runtime optimizations (batch sizing, hipBLASLt, THP).
 Phase I also builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
 from upstream `master` with the Vulkan backend for Strix Halo image generation.
 The build uses TheRock `amdclang`, Zen 5 native CPU flags, ThinLTO, AOCL-LibM,
-OpenMP, WebP/WebM support, and installs `sd-cli`/`sd-server` into
+ggml LTO, OpenMP, WebP/WebM support, and installs `sd-cli`/`sd-server` into
 `${VLLM_VENV}/vulkan/stable_diffusion`.
 
 ## Supported Distributions
