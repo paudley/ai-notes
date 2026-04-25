@@ -260,6 +260,9 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 | `vllm-runtime-helpers.sh` | Shared library for start/stop/status scripts |
 | `BUILD-FIXES.md` | Detailed documentation of all build patches and workarounds |
 | `CHANGELOG.md` | Version history and notable changes |
+| `QWEN3-VL-EMBED.md` | Bitserv deployment notes for Qwen3-VL embedding/reranking on gfx1151 |
+| `quantize_w8a16.py` | Standalone W8A16 quantization helper for Qwen3-VL embedding/reranker models |
+| `patches/` | Standalone upstream/runtime patches imported for review before manifest integration |
 
 ## Repo Variants
 

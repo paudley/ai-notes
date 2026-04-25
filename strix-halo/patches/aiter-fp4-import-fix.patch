@@ -1,0 +1,25 @@
+<!-- Copyright 2026 bitserv-ai -->
+diff --git a/vllm/_aiter_ops.py b/vllm/_aiter_ops.py
+--- a/vllm/_aiter_ops.py
++++ b/vllm/_aiter_ops.py
+@@ -1349,15 +1349,15 @@ class AiterConfig:
+     @classmethod
+     @if_aiter_supported
+     def is_fp4bmm_enabled(cls) -> bool:
+-        from vllm.platforms.rocm import on_gfx950
++        from vllm.platforms.rocm import on_gfx9
+ 
+-        return cls._AITER_ENABLED and cls._FP4BMM_ENABLED and on_gfx950()
++        return cls._AITER_ENABLED and cls._FP4BMM_ENABLED and on_gfx9()
+ 
+     @classmethod
+     @if_aiter_supported
+     def is_asm_fp4_gemm_dynamic_quant_enabled(cls) -> bool:
+-        from vllm.platforms.rocm import on_gfx950
++        from vllm.platforms.rocm import on_gfx9
+ 
+-        return cls._AITER_ENABLED and cls._FP4_GEMM_DYNAMIC_QUANT_ASM and on_gfx950()
++        return cls._AITER_ENABLED and cls._FP4_GEMM_DYNAMIC_QUANT_ASM and on_gfx9()
+ 
+     @classmethod
+     @if_aiter_supported

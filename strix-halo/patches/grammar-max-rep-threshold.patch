@@ -1,0 +1,64 @@
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+index badcbfd..17693b5 100644
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -7,10 +7,25 @@
+ #include <cmath>
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #include <set>
+ #include <stdexcept>
+ 
+-#define MAX_REPETITION_THRESHOLD 2000
++static constexpr uint64_t DEFAULT_MAX_REPETITION_THRESHOLD = 50000;
++
++llama_grammar_parser::llama_grammar_parser(const struct llama_vocab * vocab)
++    : vocab(vocab) {
++    const char * env = std::getenv("LLAMA_GRAMMAR_MAX_REPS");
++    if (env) {
++        try {
++            max_repetition_threshold = std::stoull(env);
++        } catch (...) {
++            max_repetition_threshold = DEFAULT_MAX_REPETITION_THRESHOLD;
++        }
++    } else {
++        max_repetition_threshold = DEFAULT_MAX_REPETITION_THRESHOLD;
++    }
++}
+ //
+ // helpers
+ //
+@@ -491,7 +506,7 @@ const char * llama_grammar_parser::parse_sequence(
+             total_rules = min_times;
+         }
+ 
+-        if (n_prev_rules * total_rules >= MAX_REPETITION_THRESHOLD) {
++        if (n_prev_rules * total_rules >= max_repetition_threshold) {
+             throw std::runtime_error("number of rules that are going to be repeated multiplied by the new repetition exceeds sane defaults, please reduce the number of repetitions or rule complexity");
+         }
+ 
+@@ -649,7 +664,7 @@ const char * llama_grammar_parser::parse_sequence(
+                 throw std::runtime_error(std::string("expecting ',' at ") + pos);
+             }
+             bool has_max = max_times != UINT64_MAX;
+-            if (min_times > MAX_REPETITION_THRESHOLD || (has_max && max_times > MAX_REPETITION_THRESHOLD)) {
++            if (min_times > max_repetition_threshold || (has_max && max_times > max_repetition_threshold)) {
+                 throw std::runtime_error(std::string("number of repetitions exceeds sane defaults, please reduce the number of repetitions"));
+             }
+             handle_repetitions(min_times, max_times);
+diff --git a/src/llama-grammar.h b/src/llama-grammar.h
+index b5a0e58..80dba8b 100644
+--- a/src/llama-grammar.h
++++ b/src/llama-grammar.h
+@@ -89,7 +89,9 @@ struct llama_grammar_parser {
+ 
+     llama_grammar_rules rules;
+ 
+-    llama_grammar_parser(const struct llama_vocab * vocab = nullptr) : vocab(vocab) {}
++    uint64_t max_repetition_threshold;
++
++    llama_grammar_parser(const struct llama_vocab * vocab = nullptr);
+ 
+     llama_grammar_stack c_rules() const;
+ 

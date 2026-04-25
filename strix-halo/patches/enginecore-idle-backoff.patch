@@ -1,0 +1,37 @@
+<!-- Copyright 2026 bitserv-ai -->
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 0fa59579e..4ede74cf7 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -196,6 +196,10 @@ class EngineCore:
+         )
+         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
+ 
++        # Progressive backoff for idle EngineCore busy-loop (BUILD-FIXES #96)
++        self._idle_backoff = [0.0, 0.001, 0.010, 0.100, 0.500]  # seconds
++        self._idle_level = 0
++
+         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+             caching_hash_fn = get_hash_fn_by_name(
+@@ -1189,8 +1193,18 @@ class EngineCoreProc(EngineCore):
+         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
+         # background threads (like NIXL handshake) to make progress.
+         # Without this, the tight polling loop can starve background threads.
+-        if not model_executed and self.scheduler.has_unfinished_requests():
+-            time.sleep(0.001)
++        # BUILD-FIXES #96: progressive backoff 0ms -> 1ms -> 10ms -> 100ms -> 500ms
++        if not model_executed:
++            if self.scheduler.has_unfinished_requests():
++                time.sleep(0.001)
++                self._idle_level = 0
++            else:
++                sleep_dur = self._idle_backoff[
++                    min(self._idle_level, len(self._idle_backoff) - 1)]
++                time.sleep(sleep_dur)
++                self._idle_level += 1
++        else:
++            self._idle_level = 0
+ 
+         return model_executed
+ 
