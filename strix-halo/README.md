@@ -74,53 +74,57 @@ that force PIECEWISE graph mode with AITER disabled.
    flag (proprietary Zen microarchitecture tuning not available in
    upstream LLVM).
 
-## Build Pipeline (35 Steps, 9 Phases)
+## Build Pipeline (37 Steps, 10 Phases)
 
 ```
 Phase A: ROCm SDK (TheRock)
-  1. Clone TheRock          3. Build TheRock (~3 hours)
-  2. Configure TheRock      4. Validate ROCm
+  1. Clone TheRock          4. Build TheRock (~3 hours)
+  2. Create bootstrap venv  5. Validate ROCm
+  3. Configure TheRock
 
 Phase B: CPU Libraries + Python
-  5. Build AOCL-Utils       7. Build Python 3.13 (PGO + LTO)
-  6. Build AOCL-LibM        8. Create venv
+  6. Build AOCL-Utils       8. Build Python 3.13 (PGO + LTO)
+  7. Build AOCL-LibM        9. Create final venv
 
 Phase C: ML Framework (PyTorch + TorchVision)
-  9. Clone PyTorch         12. Clone TorchVision
- 10. Build PyTorch (~1-2h) 13. Build TorchVision
- 11. Validate PyTorch
+ 10. Clone PyTorch         13. Clone TorchVision
+ 11. Build PyTorch (~1-2h) 14. Build TorchVision
+ 12. Validate PyTorch
 
 Phase D: Kernel Compilers
- 14. Clone Triton          17. Clone AOTriton
- 15. Build Triton          18. Build AOTriton
- 16. Validate Triton
+ 15. Clone Triton          18. Clone AOTriton
+ 16. Build Triton          19. Build AOTriton
+ 17. Validate Triton
 
 Phase E: Inference Engine
- 19. Clone vLLM            23. Install ROCm requirements
- 20. Patch amdsmi import   24. Build vLLM (AITER first)
- 20b. Patch gfx1151 AITER
- 21. Install build deps
- 22. use_existing_torch.py
+ 20. Clone vLLM            24. Install ROCm requirements
+ 21. Patch amdsmi import   25. Build vLLM (AITER first)
+ 21b. Patch gfx1151 AITER
+ 22. Install build deps
+ 23. use_existing_torch.py
 
 Phase F: Attention (Flash Attention + AITER)
- 25. Reinstall amdsmi      28. Build Flash Attention
- 26. Clone Flash Attention  28b. Rebuild AITER from source (CK-aligned)
- 27. Patch Flash Attention
+ 26. Reinstall amdsmi      29. Build Flash Attention
+ 27. Clone Flash Attention  29b. Rebuild AITER from source (CK-aligned)
+ 28. Patch Flash Attention
 
 Phase G: Validation + Warmup
- 29. Smoke test
- 29b. AITER JIT pre-warm   (compile all buildable modules ahead of time)
- 29c. TunableOp warmup     (populate GEMM autotuning CSV)
+ 30. Smoke test
+ 30b. AITER JIT pre-warm   (compile all buildable modules ahead of time)
+ 30c. TunableOp warmup     (populate GEMM autotuning CSV)
 
 Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
- 30. Build Rust wheels     (orjson, cryptography — AVX-512 + VAES)
- 31. Build C/C++ wheels    (numpy, sentencepiece, zstandard, asyncpg)
- 32. Export source wheels   (torch, triton, torchvision, amd-aiter, amdsmi)
+ 31. Build Rust wheels     (orjson, cryptography — AVX-512 + VAES)
+ 32. Build C/C++ wheels    (numpy, sentencepiece, zstandard, asyncpg)
+ 33. Export source wheels   (torch, triton, torchvision, amd-aiter, amdsmi)
 
 Phase I: Lemonade Inference Server
- 33. Clone Lemonade + build llama.cpp (ROCm hipBLAS + Vulkan backends)
- 34. Install Lemonade SDK from PyPI
- 35. Validate Lemonade (both backends)
+  34. Clone Lemonade + build llama.cpp (ROCm hipBLAS + Vulkan backends)
+  35. Install Lemonade SDK from PyPI
+  36. Validate Lemonade (both backends)
+
+Phase J: Backend Smoke Test
+  37. Validate all inference backends with SmolLM2
 ```
 
 ### Lemonade: Dual-Backend llama.cpp
@@ -152,7 +156,14 @@ prerequisite checks and install hints accordingly.
 `uv` and `yq` are **auto-bootstrapped** if not found on PATH. The script
 tries `go install` first (always gets latest), then falls back to
 downloading the latest release binary from GitHub. Both tools are also
-installed into the venv for self-contained builds.
+installed into the managed bootstrap/final venvs for self-contained builds.
+
+
+The build now creates a **bootstrap virtual environment** from `python3` before
+TheRock configuration/build begins, so every early `uv pip install` happens
+inside a managed env instead of leaking packages into the system interpreter.
+After step 8 compiles the optimized CPython, step 9 recreates the canonical
+vLLM environment on `/opt/src/vllm/python/bin/python3`.
 
 ## Quick Start
 
@@ -239,7 +250,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 
 | File | Description |
 |------|-------------|
-| `build-vllm.sh` | Master build script (36-step pipeline) |
+| `build-vllm.sh` | Master build script (37-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
 | `vllm-packages.yaml` | Package manifest (repos, branches, patches, per-distro prerequisites, bootstrap config) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |

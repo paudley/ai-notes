@@ -186,6 +186,17 @@ fi
 if [[ -n "${ROCM_PATH:-}" && -d "${ROCM_PATH}" ]]; then
     export LD_LIBRARY_PATH="${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     export PATH="${ROCM_PATH}/lib/llvm/bin:${ROCM_PATH}/bin:${PATH}"
+    for _omp_candidate in \
+        "${ROCM_PATH}/lib/llvm/lib/libomp.so" \
+        "${ROCM_PATH}/lib/llvm/lib/libiomp5.so" \
+        "${ROCM_PATH}/lib/libomp.so" \
+        "${ROCM_PATH}/lib/libiomp5.so"; do
+        [[ -f "${_omp_candidate}" ]] || continue
+        case ":${LD_PRELOAD:-}:" in
+            *:"${_omp_candidate}":*) break ;;
+            *) export LD_PRELOAD="${_omp_candidate}${LD_PRELOAD:+:${LD_PRELOAD}}"; break ;;
+        esac
+    done
 
     # Device bitcode may be under llvm/ or directly under amdgcn/
     if [[ -d "${ROCM_PATH}/llvm/amdgcn/bitcode" ]]; then

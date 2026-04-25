@@ -55,10 +55,142 @@ vllm_load_env "${ENV_FILE}"
 VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-180}"
 VLLM_PREFIX_CACHING_HASH_ALGO="${VLLM_PREFIX_CACHING_HASH_ALGO:-xxhash}"
+VLLM_STARTUP_ERROR_TAIL_LINES="${VLLM_STARTUP_ERROR_TAIL_LINES:-120}"
+VLLM_MAX_GPU_MEMORY_UTILIZATION="${VLLM_MAX_GPU_MEMORY_UTILIZATION:-0.98}"
+
+# Print a startup failure summary from a vLLM log file.
+#
+# Args:
+#   log_file - Path to vLLM instance log file
+vllm_print_startup_failure_details() {
+    local log_file="$1"
+    local traceback_context_lines="${VLLM_STARTUP_TRACEBACK_CONTEXT_LINES:-40}"
+
+    if [[ ! -f "${log_file}" ]]; then
+        error "No startup log found at ${log_file}"
+        return
+    fi
+
+    # vLLM often emits a generic RuntimeError at the end of startup failure.
+    # Printing where the first traceback starts helps locate root cause quickly.
+    local first_traceback_line
+    first_traceback_line="$(grep -n -m1 "Traceback (most recent call last)" "${log_file}" \
+        | cut -d: -f1 || true)"
+    if [[ -n "${first_traceback_line}" ]]; then
+        error "First traceback starts at line ${first_traceback_line} in ${log_file}"
+
+        # Print focused context around the first traceback, because vLLM often
+        # reports the true engine/core failure immediately before it.
+        local context_start context_end
+        context_start=$(( first_traceback_line - traceback_context_lines ))
+        if [[ "${context_start}" -lt 1 ]]; then
+            context_start=1
+        fi
+        context_end=$(( first_traceback_line + traceback_context_lines ))
+        error "Context around first traceback (lines ${context_start}-${context_end}):"
+        sed -n "${context_start},${context_end}p" "${log_file}" >&2
+    fi
+
+    error "Last ${VLLM_STARTUP_ERROR_TAIL_LINES} lines from ${log_file}:"
+    tail -"${VLLM_STARTUP_ERROR_TAIL_LINES}" "${log_file}" >&2
+}
 
 # =============================================================================
 # Instance Management
 # =============================================================================
+
+
+# Detect known torch.compile duplicate-pattern crash in ROCm AITER RMSNorm fusion.
+#
+# Args:
+#   log_file - Path to vLLM instance log file
+# Returns:
+#   0 if duplicate-pattern signature found, 1 otherwise
+vllm_is_aiter_rmsnorm_duplicate_pattern_failure() {
+    local log_file="$1"
+
+    [[ -f "${log_file}" ]] || return 1
+
+    grep -q "rocm_aiter_fusion.py" "${log_file}" \
+        && grep -q "check_and_add_duplicate_pattern" "${log_file}"
+}
+
+# Print targeted diagnostics for the duplicate-pattern startup crash.
+#
+# This focuses on root-cause indicators instead of only applying fallbacks:
+#   - Installed vLLM / torch / triton versions
+#   - rocm_aiter_fusion.py path from the active Python environment
+#   - Whether skip_duplicates=True is present on register_replacement calls
+#
+# Args:
+#   role - Logical instance role (main, etc.) for log prefixing
+vllm_print_duplicate_pattern_diagnostics() {
+    local role="$1"
+
+    info "${role}: collecting duplicate-pattern diagnostics (versions + patch state)"
+    python - <<'PY'
+import importlib.util
+import os
+import re
+import sys
+
+def _safe_import(name):
+    try:
+        mod = __import__(name)
+        return mod, None
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        return None, exc
+
+vllm, vllm_err = _safe_import("vllm")
+torch, torch_err = _safe_import("torch")
+triton, triton_err = _safe_import("triton")
+
+print("  diag  Python executable:", sys.executable)
+print("  diag  vLLM version:      ", getattr(vllm, "__version__", f"<import failed: {vllm_err}>"))
+print("  diag  torch version:     ", getattr(torch, "__version__", f"<import failed: {torch_err}>"))
+print("  diag  triton version:    ", getattr(triton, "__version__", f"<import failed: {triton_err}>"))
+
+target = None
+if vllm is not None:
+    spec = importlib.util.find_spec("vllm.compilation.passes.fusion.rocm_aiter_fusion")
+    if spec is not None:
+        target = spec.origin
+
+if not target or not os.path.isfile(target):
+    print("  diag  rocm_aiter_fusion: <not found in active environment>")
+    raise SystemExit(0)
+
+print("  diag  rocm_aiter_fusion: ", target)
+try:
+    text = open(target, "r", encoding="utf-8").read()
+except Exception as exc:  # pragma: no cover - diagnostics only
+    print(f"  diag  patch check:       <failed to read file: {exc}>")
+    raise SystemExit(0)
+
+try:
+    register_calls = len(re.findall(r"pm\.register_replacement\(", text))
+    skip_dupe = len(
+        re.findall(
+            r"pm\.register_replacement\([^\n]*skip_duplicates\s*=\s*True",
+            text,
+        )
+    )
+except re.error as exc:  # pragma: no cover - diagnostics only
+    print(f"  diag  regex check:       <failed: {exc}>")
+    raise SystemExit(0)
+
+print("  diag  register calls:    ", register_calls)
+print("  diag  skip_duplicates=:  ", skip_dupe)
+
+if register_calls and skip_dupe == 0:
+    print("  diag  likely root cause: active wheel is missing the skip_duplicates patch")
+    print("  diag  action: rebuild/reinstall vLLM so rocm_aiter_fusion.py includes skip_duplicates=True")
+elif register_calls and skip_dupe < register_calls:
+    print("  diag  likely root cause: partial patch application in rocm_aiter_fusion.py")
+else:
+    print("  diag  patch state:       skip_duplicates appears present")
+PY
+}
 
 start_instance() {
     local role="$1"
@@ -129,6 +261,10 @@ start_instance() {
         local total_mb utilization
         total_mb="$(vllm_gtt_total_mb)"
         utilization="$(vllm_mb_to_utilization "${gpu_memory_mb}" "${total_mb}")"
+        if [[ "$(echo "${utilization} > ${VLLM_MAX_GPU_MEMORY_UTILIZATION}" | bc)" -eq 1 ]]; then
+            warn "${role}: requested ${gpu_memory_mb}MB exceeds detected ${total_mb}MB; capping --gpu-memory-utilization to ${VLLM_MAX_GPU_MEMORY_UTILIZATION}"
+            utilization="${VLLM_MAX_GPU_MEMORY_UTILIZATION}"
+        fi
         cmd_args+=(--gpu-memory-utilization "${utilization}")
         info "${role}: GPU memory ${gpu_memory_mb}MB / ${total_mb}MB = ${utilization}"
     fi
@@ -137,37 +273,77 @@ start_instance() {
     # shellcheck disable=SC2206
     cmd_args+=(${extra_args})
 
-    info "Starting vLLM ${role}: ${model} on ${device}:${port}"
-    info "Log file: ${log_file}"
+    # Preferred switch: explicit enable for one-time retry fallback.
+    # Legacy compatibility: if VLLM_DISABLE_AITER_RMSNORM_ON_DUP_PATTERN=1 is
+    # set, treat that as enabled as well.
+    local enable_rmsnorm_retry="${VLLM_ENABLE_AITER_RMSNORM_DUP_PATTERN_RETRY:-0}"
+    if [[ "${enable_rmsnorm_retry}" != "1" ]] \
+        && [[ "${VLLM_DISABLE_AITER_RMSNORM_ON_DUP_PATTERN:-0}" == "1" ]]; then
+        enable_rmsnorm_retry="1"
+    fi
+    local launch_with_rmsnorm_disabled=0
+    local attempt
 
-    # Launch in background with per-process VLLM_TARGET_DEVICE.
-    VLLM_TARGET_DEVICE="${device}" nohup "${cmd_args[@]}" > "${log_file}" 2>&1 &
+    for attempt in 1 2; do
+        info "Starting vLLM ${role}: ${model} on ${device}:${port} (attempt ${attempt}/2)"
+        info "Log file: ${log_file}"
 
-    local instance_pid=$!
-    echo "${instance_pid}" > "${pid_file}"
-
-    # Health check loop.
-    info "Waiting for ${role} health check (timeout: ${VLLM_STARTUP_TIMEOUT}s)..."
-
-    if vllm_poll_health "${VLLM_HOST}" "${port}" "${VLLM_STARTUP_TIMEOUT}" "${instance_pid}"; then
-        success "vLLM ${role} ready (PID: ${instance_pid}, port: ${port})"
-
-        # Log which attention backend was actually selected (parse vLLM log).
-        local backend_line
-        backend_line="$(grep -oP 'Using \K\S+ out of potential backends' "${log_file}" 2>/dev/null | head -1)"
-        if [[ -n "${backend_line}" ]]; then
-            info "${role}: ${backend_line}"
+        # Launch in background with per-process VLLM_TARGET_DEVICE.
+        local -a launch_env=(
+            VLLM_TARGET_DEVICE="${device}"
+        )
+        if [[ "${launch_with_rmsnorm_disabled}" -eq 1 ]]; then
+            launch_env+=(VLLM_ROCM_USE_AITER_RMSNORM=0)
         fi
-        return 0
-    fi
+        env "${launch_env[@]}" nohup "${cmd_args[@]}" > "${log_file}" 2>&1 &
 
-    # Failed: check if process died or timed out.
-    if ! kill -0 "${instance_pid}" 2>/dev/null; then
-        error "vLLM ${role} (PID ${instance_pid}) died during startup. Last 30 lines:"
-    else
-        error "vLLM ${role} did not become healthy within ${VLLM_STARTUP_TIMEOUT}s. Last 30 lines:"
-    fi
-    tail -30 "${log_file}" >&2
+        local instance_pid=$!
+        echo "${instance_pid}" > "${pid_file}"
+
+        # Health check loop.
+        info "Waiting for ${role} health check (timeout: ${VLLM_STARTUP_TIMEOUT}s)..."
+
+        if vllm_poll_health "${VLLM_HOST}" "${port}" "${VLLM_STARTUP_TIMEOUT}" "${instance_pid}"; then
+            success "vLLM ${role} ready (PID: ${instance_pid}, port: ${port})"
+
+            # Log which attention backend was actually selected (parse vLLM log).
+            local backend_line
+            backend_line="$(grep -oP 'Using \K\S+ out of potential backends' "${log_file}" 2>/dev/null | head -1)"
+            if [[ -n "${backend_line}" ]]; then
+                info "${role}: ${backend_line}"
+            fi
+            return 0
+        fi
+
+        # Failed: check if process died or timed out.
+        if ! kill -0 "${instance_pid}" 2>/dev/null; then
+            error "vLLM ${role} (PID ${instance_pid}) died during startup."
+        else
+            error "vLLM ${role} did not become healthy within ${VLLM_STARTUP_TIMEOUT}s."
+        fi
+
+        # Automatic one-time fallback for known duplicate pattern crash in
+        # RocmAiterRMSNormQuantFusionPass.
+        if [[ "${VLLM_ROCM_USE_AITER_RMSNORM:-0}" == "1" ]] \
+            && vllm_is_aiter_rmsnorm_duplicate_pattern_failure "${log_file}"; then
+            vllm_print_duplicate_pattern_diagnostics "${role}"
+
+            if [[ "${enable_rmsnorm_retry}" == "1" ]] \
+                && [[ "${launch_with_rmsnorm_disabled}" -eq 0 ]]; then
+                launch_with_rmsnorm_disabled=1
+                warn "${role}: detected AITER RMSNorm duplicate-pattern startup crash; retrying with VLLM_ROCM_USE_AITER_RMSNORM=0"
+                rm -f "${pid_file}"
+                continue
+            fi
+            warn "${role}: detected AITER RMSNorm duplicate-pattern startup crash"
+            warn "${role}: retry fallback is disabled (set VLLM_ENABLE_AITER_RMSNORM_DUP_PATTERN_RETRY=1 to enable one-time retry)"
+        fi
+
+        vllm_print_startup_failure_details "${log_file}"
+        rm -f "${pid_file}"
+        return 1
+    done
+
     rm -f "${pid_file}"
     return 1
 }

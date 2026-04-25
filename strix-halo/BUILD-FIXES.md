@@ -122,6 +122,227 @@ install it when `THEROCK_BUILD_TESTING=OFF`.
 
 **Fix**: Copy `FileCheck` from the build tree to the LLVM bin directory.
 
+### 10b. libhipcxx atomic_codegen gated only on FileCheck
+
+**Symptom**: TheRock configure fails in `math-libs/libhipcxx` with:
+`Could not find cuobjdump using the following names: cuobjdump`
+
+**Root cause**: libhipcxx's `test/atomic_codegen` cmake logic is guarded only
+by whether `FileCheck` exists. On HIP-only ROCm builds, `/usr/bin/FileCheck`
+is present, so cmake enters the CUDA-only atomic codegen test path and then
+hard-requires NVIDIA's `cuobjdump`, aborting configuration.
+
+**Fix**: Replace the `if (filecheck)` guard with
+`if (filecheck AND LIBCUDACXX_ENABLE_CUDA)`, so those tests only configure
+when the CUDA backend is actually enabled.
+
+**Does this involve FileCheck?**: Yes. `FileCheck` is the trigger that causes
+the CUDA-only atomic codegen directory to configure in the first place. The
+fatal missing tool is still `cuobjdump`, but the bad guard is the
+`if (filecheck)` check.
+
+### 10c. roctx64 pre-hooks ignore `THEROCK_ENABLE_PROFILER=OFF`
+
+**Symptom**: TheRock configure fails in RCCL (and potentially rocBLAS or
+rocSPARSE) with:
+`Could not find _therock_legacy_roctx64 using the following names: roctx64`
+
+**Root cause**: Several TheRock pre-hook cmake files unconditionally run a
+legacy `roctx64` link-patch on Linux. Our top-level configuration explicitly
+sets `-DTHEROCK_ENABLE_PROFILER=OFF`, so the profiler stack and `roctx64`
+library are intentionally absent. The pre-hooks should not hard-require
+`roctx64` when profiling is disabled.
+
+**Fix**: Gate the affected Linux pre-hooks on
+`if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)` instead of just `if(NOT WIN32)`.
+This preserves the workaround when the profiler stack is enabled while
+allowing profiler-disabled builds to configure normally.
+
+### 10d. Disable ROCgdb in TheRock configure
+
+**Symptom**: TheRock build later fails in `debug-tools/rocgdb` even though the
+core ROCm compiler/runtime libraries continue building in parallel.
+
+**Root cause**: ROCgdb is an optional ROCm debugger component. It is not needed
+for building or running the vLLM/PyTorch/Triton stack, but TheRock enables it
+by default as part of its debug-tools feature set.
+
+**Fix**: Pass `-DTHEROCK_ENABLE_ROCGDB=OFF` during TheRock configure. This
+skips the optional debugger subproject while preserving the rest of the ROCm
+SDK required by the inference stack.
+
+### 10e. RCCL enables ROCTX even when profiler is disabled
+
+**Symptom**: RCCL configure later fails with:
+`Could not find super-project find_library(NAMES roctx64)`
+
+**Root cause**: RCCL's own cmake enables `ROCTX` by default. When `ROCTX` is
+on, it calls `find_library(roctx64)` and `find_path(roctracer/roctx.h)`.
+That conflicts with this build's `THEROCK_ENABLE_PROFILER=OFF` setting, where
+the profiler stack and `roctx64` are intentionally unavailable.
+
+**Fix**: Inject `-DROCTX=OFF` into TheRock's RCCL subproject cmake args so
+RCCL skips its optional ROCTX tracing path entirely.
+
+### 10f. RCCL rccl_common.h misses tuner macro definitions
+
+**Symptom**: RCCL's `rccl_wrap.cc` fails during the TheRock build with:
+`use of undeclared identifier 'NCCL_NUM_ALGORITHMS'` and
+`use of undeclared identifier 'NCCL_NUM_PROTOCOLS'`
+
+**Root cause**: Newer RCCL snapshots moved `NCCL_NUM_ALGORITHMS` and
+`NCCL_NUM_PROTOCOLS` into `src/include/plugin/nccl_tuner.h`, but
+`src/include/rccl_common.h` still references them after including only
+`nccl_common.h`, `nccl.h`, `param.h`, and `core.h`. In the generated hipify
+header tree that leaves the tuner macros undefined when `rccl_wrap.cc`
+compiles.
+
+**Fix**: Inject `#include "plugin/nccl_tuner.h"` into `rocm-systems/projects/rccl/src/include/rccl_common.h` so the
+internal tuner macro definitions are available before the RCCL addon algorithm
+and protocol declarations.
+
+### 10g. RCCL nvtx.h ignores NVTX stub mode for direct includes
+
+**Symptom**: RCCL's `group.cc` fails during the TheRock build with macro
+redefinition warnings followed by `redefinition of 'nccl_domain'` between
+`nvtx.h` and `nvtx_stub.h`.
+
+**Root cause**: TheRock already passes `-DNVTX_NO_IMPL`, and RCCL's `core.h`
+properly switches to `nvtx_stub.h` in that mode. However, some RCCL sources
+include `nvtx.h` directly, and `nvtx.h` itself does not currently honor
+`NVTX_NO_IMPL`, so both the real NVTX declarations and the stub declarations
+end up active in the same translation unit.
+
+**Fix**: Wrap `rocm-systems/projects/rccl/src/include/nvtx.h` itself in an
+`#ifdef NVTX_NO_IMPL` guard that includes `nvtx_stub.h`, and extend
+`rocm-systems/projects/rccl/src/include/nvtx_stub.h` with a no-op
+`NCCL_NVTX3_FUNC_RANGE` definition so sources using the common NVTX macro
+surface still compile in stub mode.
+
+### 10h. hipBLASLt enables ROCTX markers by default
+
+**Symptom**: hipBLASLt configure fails with:
+`Could not find super-project find_library(NAMES roctx64)`
+
+**Root cause**: hipBLASLt's cmake has `HIPBLASLT_ENABLE_MARKER` enabled by
+default for shared-library builds. When enabled, it calls `find_library(roctx64)`
+and hard-fails if roctracer is absent. That is incompatible with this build's
+`THEROCK_ENABLE_PROFILER=OFF` configuration.
+
+**Fix**: Inject `-DHIPBLASLT_ENABLE_MARKER=OFF` into TheRock's hipBLASLt
+subproject cmake args so it skips the optional ROCTX marker path entirely.
+
+### 10f2. hipSPARSELt enables ROCTX markers by default
+
+**Symptom**: hipSPARSELt configure fails with:
+`Could not find ROCTX64_LIBRARY using the following names: roctx64, libroctx64`
+
+**Root cause**: hipSPARSELt's top-level cmake defines
+`HIPSPARSELT_ENABLE_MARKER` as ON by default on non-Windows builds. When that
+option is enabled, it unconditionally calls `find_library(ROCTX64_LIBRARY ...)`
+and `find_path(roctracer/roctx.h ...)`. That conflicts with this build's
+`THEROCK_ENABLE_PROFILER=OFF` configuration, where roctracer/roctx64 are
+intentionally absent.
+
+**Fix**: Inject `-DHIPSPARSELT_ENABLE_MARKER=OFF` into TheRock's hipSPARSELt
+subproject cmake args so configure skips the optional ROCTX marker path.
+
+### 10f3. MIOpen still probes roctracer headers when profiler is disabled
+
+**Symptom**: MIOpen configure fails with:
+`Could not find super-project find_path(NAMES roctracer/roctx.h)`
+
+**Root cause**: MIOpen's top-level `CMakeLists.txt` sets
+`MIOPEN_USE_ROCTRACER` to `ON` by default. On non-Windows builds that makes
+configure call `find_path(roctracer/roctx.h)` and `find_library(roctx64)`,
+which conflicts with this build's `THEROCK_ENABLE_PROFILER=OFF`
+configuration where roctracer/roctx64 are intentionally absent.
+
+**Fix**: Inject `-DMIOPEN_USE_ROCTRACER=OFF` into TheRock's MIOpen subproject
+cmake args so the optional rocTracer/ROCTX probe is skipped entirely.
+
+### 10g. rocprofiler-sdk yaml-cpp patch path moved in current TheRock layout
+
+**Symptom**: rocprofiler-sdk later fails compiling vendored yaml-cpp with
+undeclared `uint16_t` / `uint32_t` in `external/yaml-cpp/src/emitterutils.cpp`.
+
+**Root cause**: The source patch for yaml-cpp's missing `<cstdint>` include was
+targeting an old path layout and no longer matched the current TheRock source
+tree. As a result, the workaround never applied.
+
+**Fix**: Update the patch target path to
+`rocm-systems/projects/rocprofiler-sdk/external/yaml-cpp/src/emitterutils.cpp`
+so the existing `<cstdint>` insertion applies to the actual vendored file.
+
+### 10h. rocBLAS still probes roctracer headers when profiler is disabled
+
+**Symptom**: rocBLAS configure fails with:
+`Could not find super-project find_path(... roctracer/roctx.h ...)`
+even though TheRock already passes `-DROCTX=OFF` to the rocBLAS subproject.
+
+**Root cause**: rocBLAS's `projects/rocblas/library/CMakeLists.txt` gates the
+ROCTX probe only on `BUILD_SHARED_LIBS`. Its `find_path(roctracer/roctx.h)` and
+`find_library(roctx64)` block does not honor the `ROCTX` cache option, so the
+header/library probe still runs in shared-library builds even when profiling is
+explicitly disabled.
+
+**Fix**: Keep injecting `-DROCTX=OFF` from TheRock's `math-libs/BLAS/CMakeLists.txt`,
+and patch `rocm-libraries/projects/rocblas/library/CMakeLists.txt` in two ways:
+first, guard the ROCTX probe with `if(BUILD_SHARED_LIBS AND ROCTX)` instead of
+only `if(BUILD_SHARED_LIBS)`; second, add `target_compile_definitions(... DISABLE_ROCTX)`
+when `ROCTX` is off so sources like `logging.cpp` do not include
+`<roctracer/roctx.h>` after the probe has been skipped.
+
+
+### 10h2. rocSPARSE still probes roctracer headers unless BUILD_WITH_ROCTX is turned off
+
+**Symptom**: rocSPARSE configure fails with:
+`Could not find super-project find_path(... roctracer/roctx.h ...)`
+
+**Root cause**: Unlike rocBLAS, rocSPARSE already has an upstream
+`if(BUILD_SHARED_LIBS AND BUILD_WITH_ROCTX)` guard around its ROCTX probing in
+`projects/rocsparse/library/CMakeLists.txt`. However, TheRock's
+`math-libs/BLAS/CMakeLists.txt` does not pass `-DBUILD_WITH_ROCTX=OFF` to the
+rocSPARSE subproject, so the guarded probe still stays enabled by default and
+hits the explicit super-project finder when profiler components are absent.
+
+**Fix**: Inject `-DBUILD_WITH_ROCTX=OFF` into TheRock's rocSPARSE subproject
+cmake args so rocSPARSE skips the optional roctx header/library probe entirely.
+
+### 10i. ROCR-Runtime OpenCL blit kernels do not know the device-lib path while bootstrapping
+
+**Symptom**: TheRock build fails in `rocm-systems/projects/rocr-runtime` while
+building `opencl_blit_objects` with a command like:
+`clang -O2 -x cl ... imageblit_kernels.cl`
+followed by:
+`cannot find ROCm device library; provide its path via '--rocm-path' or '--rocm-device-lib-path'`
+
+**Root cause**: `runtime/hsa-runtime/image/blit_src/CMakeLists.txt` hard-codes
+a `clang -x cl` custom command for the OpenCL blit kernels, but it does not
+pass any ROCm install root or device-library path. During a TheRock bootstrap
+build, clang cannot infer the just-built `amdgcn/bitcode` directory on its own,
+so current clang releases abort instead of compiling the embedded blit objects.
+
+**Fix**: Patch `rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/image/blit_src/CMakeLists.txt`
+to detect `${CMAKE_PREFIX_PATH}/llvm/amdgcn/bitcode` or
+`${CMAKE_PREFIX_PATH}/amdgcn/bitcode` and append
+`--rocm-device-lib-path=<detected path>` to the generated `clang -x cl` command.
+
+### 25b. YAML patchelf RPATH expansion treated `$ORIGIN` as a shell variable
+
+**Symptom**: `build-vllm.sh` aborts while applying `patchelf_rpath` patches
+with:
+`./build-vllm.sh: line 754: ORIGIN: unbound variable`
+
+**Root cause**: The YAML-driven patch helper expanded RPATH templates with
+`eval echo`. That works for `${LOCAL_PREFIX}` but also tries to expand ELF
+loader tokens like `$ORIGIN` as shell variables, which fails under
+`set -u`.
+
+**Fix**: Escape `$ORIGIN` before running `eval echo` so shell variable
+expansion still resolves our repo variables while preserving the literal ELF
+RPATH token for `patchelf`.
+
 ## AOCL-LibM (Phase B, Step 6)
 
 ### 11. -muse-unaligned-vector-move (AOCC-only flag)
@@ -209,12 +430,15 @@ namespace declaration and a comment explaining the removal.
 **Symptom**: Undefined symbol errors at link time (e.g., `const_data_ptr<Half>`
 mangled differently between `libtorch_cpu.so` and `libtorch_hip.so`).
 
-**Root cause**: PyTorch's `cmake/Dependencies.cmake` adds
-`-fclang-abi-compat=17` to HIPCC flags "for compat with newer hip-clang C++20
-mangling rules". This forces HIP device code to use Clang 17 ABI while host
-code uses amdclang 22 ABI, causing name mangling mismatches.
+**Root cause**: PyTorch's ROCm build injects `-fclang-abi-compat=17` in two
+places: top-level host flags in `CMakeLists.txt` and HIP flags in
+`cmake/Dependencies.cmake`. On current amdclang releases that Clang 17 ABI
+override can still leave host/HIP objects mangled inconsistently, producing
+undefined symbols between `libtorch_cpu.so` and `libtorch_hip.so`.
 
-**Fix**: Remove the `-fclang-abi-compat=17` line from `Dependencies.cmake`.
+**Fix**: Remove both `-fclang-abi-compat=17` injections — the host-side
+`append_cxx_flag_if_supported(... CMAKE_CXX_FLAGS)` line in `CMakeLists.txt`
+and the HIPCC line in `cmake/Dependencies.cmake`.
 
 ### 19. Missing librocm_smi64.so linkage (upstream bug)
 
@@ -329,7 +553,24 @@ build tree references:
 patchelf --set-rpath '/opt/src/vllm/local/lib:$ORIGIN' torch/lib/libtorch_python.so
 ```
 
-### 25c. NumPy 2.0 ABI target version
+### 25c. Validation retry for stale installed torch artifacts
+
+**Symptom**: Step 12 (`Validate PyTorch GPU access`) fails on `import torch`
+with `libtorch_hip.so: undefined symbol: _ZN2at4cuda4blas4gemm...` even
+though the wheel was rebuilt from a clean `build/` directory.
+
+**Root cause**: In some failed/retried builds, the virtualenv can still hold
+stale `torch/`, `torch-*.dist-info`, or `functorch/` artifacts from an older
+install. When Python resolves mixed old/new extension modules from the same
+environment, `libtorch_hip.so` can be loaded without the matching symbol
+provider from the rebuilt wheel.
+
+**Fix**: During validation, detect this exact unresolved-symbol import
+failure, remove old torch artifacts from the active site-packages directory,
+reinstall the newest locally built torch wheel with `uv pip install
+--force-reinstall --no-deps`, and retry the import once before failing.
+
+### 25d. NumPy 2.0 ABI target version
 
 **Symptom**: `import torch` crashes with "A module that was compiled using
 NumPy 1.x cannot be run in NumPy 2.4.3".
@@ -342,6 +583,30 @@ check when loaded with numpy >= 2.0.
 **Fix**: Patch `torch/csrc/utils/numpy_stub.h` to set `NPY_TARGET_VERSION`
 before including `<numpy/arrayobject.h>`:
 
+### 25e. Missing OpenMP runtime linkage in libtorch_cpu.so
+
+**Symptom**: `import torch` fails immediately with:
+
+```text
+ImportError: .../torch/lib/libtorch_cpu.so: undefined symbol: __kmpc_fork_call
+```
+
+**Root cause**: PyTorch was built with clang/amdclang OpenMP enabled, so
+`libtorch_cpu.so` references the `__kmpc_*` entry points provided by LLVM's
+OpenMP runtime (`libomp.so` / `libiomp5.so`). In some builds the packaged wheel
+omits that runtime from `libtorch_cpu.so`'s `NEEDED` list, so the dynamic
+linker never loads it during `import torch`.
+
+**Fix**: Do **not** rewrite PyTorch's internal ELF dependency graph to force in
+an OpenMP runtime. That proved brittle and could trigger follow-on import
+failures in `libtorch_hip.so`. Instead, preload LLVM's OpenMP runtime from the
+environment whenever it exists under `${LOCAL_PREFIX}/lib/llvm/lib` or
+`${LOCAL_PREFIX}/lib`:
+
+```bash
+export LD_PRELOAD=/opt/src/vllm/local/lib/llvm/lib/libomp.so${LD_PRELOAD:+:$LD_PRELOAD}
+```
+
 ```c
 #ifndef NPY_TARGET_VERSION
 #define NPY_TARGET_VERSION 0x00000012  /* NPY_2_0_API_VERSION */
@@ -350,6 +615,24 @@ before including `<numpy/arrayobject.h>`:
 
 The hex value must be used directly because `NPY_2_0_API_VERSION` is defined
 inside `numpyconfig.h` which is included by `arrayobject.h`.
+
+### 25d. PyTorch wheel misses the LLVM OpenMP runtime path/dependency
+
+**Symptom**: `import torch` fails immediately with:
+`ImportError: .../libtorch_cpu.so: undefined symbol: __kmpc_fork_call`
+
+**Root cause**: The source-built PyTorch wheel is compiled with amdclang's
+OpenMP runtime, but the packaged wheel patching only added
+`${LOCAL_PREFIX}/lib` to RPATH and only injected `librocm_smi64.so` into
+`libtorch_hip.so`. The OpenMP runtime lives under
+`${LOCAL_PREFIX}/lib/llvm/lib`, and some wheel builds also leave
+`libtorch_cpu.so` without an explicit `libomp.so` NEEDED entry. That leaves
+the `__kmpc_*` symbols unresolved at import time.
+
+**Fix**: During the unpack/patch/repack step, rewrite PyTorch wheel RPATHs to
+include both `${LOCAL_PREFIX}/lib` and `${LOCAL_PREFIX}/lib/llvm/lib`, and add
+`libomp.so` to `libtorch_cpu.so` when it still exports unresolved
+`__kmpc_fork_call` without an existing `libomp` dependency.
 
 ## TorchVision (Phase C, Steps 12-13)
 
@@ -560,21 +843,21 @@ pass as a single HIPGraph) combined with ALL AITER optimizations
 (attention, GEMM, normalization). Previously, the `+rms_norm` bug forced
 PIECEWISE graph mode with AITER disabled.
 
-### 41. Triton sampler page fault on gfx1151 (Patch 10)
+### 41. Triton sampler page fault on gfx1151 (historical, build-specific)
 
-**Symptom**: GPU page fault during top-k/top-p sampling after torch.compile
-AOT compilation on RDNA 3.5.
+**Symptom**: Some builds observed GPU page faults during top-k/top-p sampling
+after torch.compile AOT compilation on RDNA 3.5.
 
-**Root cause**: The Triton top-k/top-p sampler kernel
-(`apply_top_k_top_p_triton`) page-faults on gfx1151 after ahead-of-time
-compilation by torch.compile. The kernel works in eager mode but the
-compiled version triggers an illegal memory access on RDNA 3.5's wave32
-architecture.
+**Root cause**: This is not a universal hardware limitation. It is a stack
+compatibility issue (specific vLLM/PyTorch/Triton/AITER combinations and
+cached compile artifacts), where the compiled sampler path can diverge from
+its eager behavior. On other builds of the same hardware/OS, the Triton
+sampler works correctly.
 
-**Fix**: Bypass the Triton sampler in
-`vllm/v1/sample/ops/topk_topp_sampler.py`. The PyTorch sort-based path
-(`topk` + `cumsum`) is functionally identical and works on all
-architectures.
+**Current approach**: Do **not** hard-disable Triton sampler in the build
+patch set. Keep upstream behavior by default and treat sampler faults as an
+investigation target (version skew, patch skew, stale compile cache, and
+backend selection), not a blanket architecture rule.
 
 ### 42. FLA chunk_delta_h autotuner + exp() type inference (Patches 11-15)
 

@@ -89,7 +89,7 @@ platform:
 
 build:
   vllm_dir: "/opt/src/vllm"
-  total_steps: 36
+  total_steps: 37
   cpython_version: "3.13.12"
   disk_required_gb: 100
   clang_min_version: 21
@@ -187,59 +187,60 @@ steps:
   #   clone:<pkg_key> entries are dispatched to clone_pkg() automatically.
   #   All other entries are shell function names called directly.
   1:  { clone: therock, desc: "TheRock ROCm source (with submodules)" }
-  2:  configure_therock
-  3:  build_therock
-  4:  validate_rocm
+  2:  create_bootstrap_venv
+  3:  configure_therock
+  4:  build_therock
+  5:  validate_rocm
 
   # Phase B: CPU Libraries + Python
-  5:  build_aocl_utils
-  6:  build_aocl_libm
-  7:  build_python
-  8:  create_venv
+  6:  build_aocl_utils
+  7:  build_aocl_libm
+  8:  build_python
+  9:  create_final_venv
 
   # Phase C: ML Framework (PyTorch + TorchVision)
-  9:  { clone: pytorch, desc: "PyTorch source (ROCm fork)" }
-  10: build_pytorch
-  11: validate_pytorch
-  12: { clone: torchvision, desc: "TorchVision source" }
-  13: build_torchvision
+  10: { clone: pytorch, desc: "PyTorch source (ROCm fork)" }
+  11: build_pytorch
+  12: validate_pytorch
+  13: { clone: torchvision, desc: "TorchVision source" }
+  14: build_torchvision
 
   # Phase D: Kernel Compilers (Triton + AOTriton)
-  14: { clone: triton, desc: "Triton source (ROCm fork)" }
-  15: build_triton
-  16: validate_triton
-  17: { clone: aotriton, desc: "AOTriton (ahead-of-time Triton kernels)" }
-  18: build_aotriton
+  15: { clone: triton, desc: "Triton source (ROCm fork)" }
+  16: build_triton
+  17: validate_triton
+  18: { clone: aotriton, desc: "AOTriton (ahead-of-time Triton kernels)" }
+  19: build_aotriton
 
   # Phase E: Inference Engine (vLLM)
-  19: { clone: vllm, desc: "vLLM source" }
-  20: [patch_amdsmi_import, patch_vllm_gfx1151]
-  21: install_build_deps
-  22: run_use_existing_torch
-  23: install_rocm_requirements
-  24: build_vllm
+  20: { clone: vllm, desc: "vLLM source" }
+  21: [patch_amdsmi_import, patch_vllm_gfx1151]
+  22: install_build_deps
+  23: run_use_existing_torch
+  24: install_rocm_requirements
+  25: build_vllm
 
   # Phase F: Attention (Flash Attention + AITER)
-  25: reinstall_amdsmi
-  26: { clone: flash_attention, desc: "Flash Attention (main_perf branch)" }
-  27: patch_flash_amdsmi
-  28: [build_flash_attention, rebuild_aiter, patch_aiter_gfx1151]
+  26: reinstall_amdsmi
+  27: { clone: flash_attention, desc: "Flash Attention (main_perf branch)" }
+  28: patch_flash_amdsmi
+  29: [build_flash_attention, rebuild_aiter, patch_aiter_gfx1151]
 
   # Phase G: Validation + Warmup
-  29: [smoke_test, warmup_aiter_jit]
+  30: [smoke_test, warmup_aiter_jit]
 
   # Phase H: Optimized Wheels
-  30: build_rust_wheels
-  31: build_native_wheels
-  32: export_source_wheels
+  31: build_rust_wheels
+  32: build_native_wheels
+  33: export_source_wheels
 
   # Phase I: Lemonade Inference Server
-  33: clone_and_build_lemonade
-  34: install_lemonade_sdk
-  35: validate_lemonade
+  34: clone_and_build_lemonade
+  35: install_lemonade_sdk
+  36: validate_lemonade
 
   # Phase J: Backend Smoke Test (all inference backends)
-  36: backend_smoke_test
+  37: backend_smoke_test
 
 # =============================================================================
 # Packages: per-component metadata (repos, patches, build notes)
@@ -257,7 +258,7 @@ packages:
     src_dir: "therock"
     method: cmake
     phase: A
-    steps: [1, 2, 3, 4]
+    steps: [1, 3, 4, 5]
     depends_on: []
     compiler: gcc
     skip_marker: "lib/libamdhip64.so"
@@ -306,7 +307,7 @@ packages:
 
       # 3. Add <cstdint> to yaml-cpp (transitive include removed)
       - type: sed
-        file: "external/rocprofiler-sdk/external-rocprofiler-sdk/external/yaml-cpp/src/emitterutils.cpp"
+        file: "rocm-systems/projects/rocprofiler-sdk/external/yaml-cpp/src/emitterutils.cpp"
         marker: "<cstdint>"
         marker_absent: true
         sed_command: "/#include <algorithm>/a #include <cstdint>"
@@ -317,7 +318,7 @@ packages:
 
       # 4. Add <cstdint> to elfio (same transitive include issue)
       - type: sed
-        file: "external/rocprofiler-sdk/external-rocprofiler-sdk/external/elfio/elfio/elf_types.hpp"
+        file: "rocm-systems/projects/rocprofiler-sdk/external/elfio/elfio/elf_types.hpp"
         marker: "<cstdint>"
         marker_absent: true
         sed_command: "/#define ELFTYPES_H/a #include <cstdint>"
@@ -346,6 +347,217 @@ packages:
           cmake which unconditionally copies it into the wheel. TheRock
           builds it but doesn't install it when THEROCK_BUILD_TESTING=OFF.
 
+      # 7. Skip CUDA-only libhipcxx atomic_codegen tests when nvcc/cuobjdump are absent
+      - type: sed
+        file: "math-libs/libhipcxx/test/atomic_codegen/CMakeLists.txt"
+        marker: "if (filecheck)"
+        sed_command: '/if (filecheck)/,/endif()/c if (filecheck AND LIBCUDACXX_ENABLE_CUDA)\n  message(\"-- ${filecheck} found... building atomic codegen tests\")\nelse()\n  return()\nendif()'
+        description: >
+          Skip libhipcxx atomic_codegen tests unless the CUDA backend is
+          actually enabled. Upstream gates this directory only on FileCheck,
+          so HIP-only ROCm builds still enter the CUDA-specific test setup and
+          then fail on missing NVIDIA tools like cuobjdump.
+
+
+      # 8. ROCR-Runtime OpenCL blit kernels need an explicit ROCm device-lib path
+      - type: sed
+        file: "rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/image/blit_src/CMakeLists.txt"
+        marker: "--rocm-device-lib-path"
+        marker_absent: true
+        sed_command: '/function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)/a \
+  set(_rocm_device_lib_path "")\n  foreach(_candidate ${CMAKE_PREFIX_PATH}/llvm/amdgcn/bitcode ${CMAKE_PREFIX_PATH}/amdgcn/bitcode)\n    if(EXISTS "${_candidate}")\n      set(_rocm_device_lib_path "${_candidate}")\n      break()\n    endif()\n  endforeach()\n  if(_rocm_device_lib_path)\n    set(_rocm_device_lib_flag "--rocm-device-lib-path=${_rocm_device_lib_path}")\n  endif()'
+        description: >
+          Teach ROCR-Runtime's OpenCL blit kernel generator where ROCm device
+          bitcode lives during TheRock builds. Its custom clang -x cl command
+          does not inherit a usable default ROCm install root while bootstrapping,
+          so current clang releases abort unless --rocm-device-lib-path points
+          at the amdgcn/bitcode directory under CMAKE_PREFIX_PATH.
+      - type: sed
+        file: "rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/image/blit_src/CMakeLists.txt"
+        marker: "-mcode-object-version=4 -o"
+        sed_command: 's|-mcode-object-version=4 |-mcode-object-version=4 ${_rocm_device_lib_flag} |'
+        description: >
+          Append the detected ROCm device-lib path to ROCR-Runtime's clang -x cl
+          blit compile command so the generated ocl_blit_object_* bitcode builds
+          against the just-built device libraries instead of failing discovery.
+
+      # 8. Skip roctx64 patch hooks when profiler stack is disabled
+      - type: sed
+        file: "comm-libs/pre_hook_rccl.cmake"
+        marker: "if(NOT WIN32)"
+        sed_command: "s|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|"
+        description: >
+          Skip RCCL's legacy roctx64 link patch when TheRock profiler support
+          is disabled. The top-level build config sets THEROCK_ENABLE_PROFILER=OFF,
+          so roctracer/roctx64 are intentionally unavailable and should not be
+          hard-required during RCCL configure.
+
+      - type: sed
+        file: "math-libs/BLAS/pre_hook_rocBLAS.cmake"
+        marker: "if(NOT WIN32)"
+        sed_command: "s|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|"
+        description: >
+          Skip rocBLAS' legacy roctx64 link patch when the profiler stack is
+          disabled, matching the top-level THEROCK_ENABLE_PROFILER=OFF build.
+
+      - type: sed
+        file: "math-libs/BLAS/pre_hook_rocSPARSE.cmake"
+        marker: "if(NOT WIN32)"
+        sed_command: "s|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|"
+        description: >
+          Skip rocSPARSE's legacy roctx64 link patch when the profiler stack is
+          disabled, avoiding the same missing-roctx64 configure failure later in
+          the math library build.
+
+      # 9. Disable RCCL ROCTX tracing when profiler stack is disabled
+      - type: sed
+        file: "comm-libs/CMakeLists.txt"
+        marker: "-DROCTX=OFF"
+        marker_absent: true
+        sed_command: '/-DENABLE_MSCCL_KERNEL=OFF/a\      -DROCTX=OFF'
+        description: >
+          Disable RCCL's optional ROCTX tracing integration. Upstream RCCL
+          enables ROCTX by default and later calls find_library(roctx64),
+          which fails under TheRock builds configured with
+          THEROCK_ENABLE_PROFILER=OFF because roctracer/roctx64 are not built.
+
+      # 9b. Restore RCCL tuner macro definitions before rccl_common.h uses them
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/include/rccl_common.h"
+        marker: '#include "plugin/nccl_tuner.h"'
+        marker_absent: true
+        sed_command: |-
+          /#include "nccl.h"/a\
+          #include "plugin\/nccl_tuner.h"
+        description: >
+          Ensure RCCL's internal tuner macros are visible before rccl_common.h
+          references NCCL_NUM_ALGORITHMS and NCCL_NUM_PROTOCOLS. The current
+          RCCL snapshot defines those macros in plugin/nccl_tuner.h, so newer
+          rccl_common.h revisions fail to compile if that header is not pulled
+          in explicitly.
+
+      # 9c. Make RCCL's NVTX header honor the stub-only build configuration
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/include/nvtx.h"
+        marker: '#ifdef NVTX_NO_IMPL'
+        marker_absent: true
+        sed_command: |-
+          /^#define NCCL_NVTX_H_$/a\
+          #ifdef NVTX_NO_IMPL\
+          #include "nvtx_stub.h"\
+          #else
+        description: >
+          Make RCCL's nvtx.h defer to nvtx_stub.h when TheRock passes
+          -DNVTX_NO_IMPL. Some sources include nvtx.h directly instead of going
+          through core.h, so without this guard the real NVTX declarations and
+          stub declarations are both compiled, causing nccl_domain and macro
+          redefinition errors.
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/include/nvtx.h"
+        marker: '#endif // NVTX_NO_IMPL'
+        marker_absent: true
+        sed_command: |-
+          $i\
+          #endif // NVTX_NO_IMPL
+        description: >
+          Close the NVTX_NO_IMPL guard added to RCCL's nvtx.h so profiler-
+          disabled builds consistently use the stub header path.
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/include/nvtx_stub.h"
+        marker: '#define NCCL_NVTX3_FUNC_RANGE'
+        marker_absent: true
+        sed_command: |-
+          /#define NVTX3_RANGE_ADD_PAYLOAD(N, S, P)/a\
+          #define NCCL_NVTX3_FUNC_RANGE
+        description: >
+          Extend RCCL's NVTX stub header with a no-op NCCL_NVTX3_FUNC_RANGE
+          definition. Several sources use that macro through core.h, so once
+          nvtx.h honors NVTX_NO_IMPL the stub path must also provide the same
+          API surface.
+
+      # 10. Disable hipBLASLt ROCTX marker support when profiler stack is disabled
+      - type: sed
+        file: "math-libs/BLAS/CMakeLists.txt"
+        marker: "-DHIPBLASLT_ENABLE_MARKER=OFF"
+        marker_absent: true
+        sed_command: '/-DHIPBLASLT_ENABLE_THEROCK=ON/a\    -DHIPBLASLT_ENABLE_MARKER=OFF'
+        description: >
+          Disable hipBLASLt's optional ROCTX marker integration. hipBLASLt
+          enables markers by default when BUILD_SHARED_LIBS is on, and then
+          hard-fails if roctx64 is not present. That conflicts with
+          THEROCK_ENABLE_PROFILER=OFF, where roctracer/roctx64 are intentionally
+          not built.
+
+      - type: sed
+        file: "math-libs/BLAS/CMakeLists.txt"
+        marker: "-DHIPSPARSELT_ENABLE_MARKER=OFF"
+        marker_absent: true
+        sed_command: '/-DHIPSPARSELT_ENABLE_THEROCK=ON/a\    -DHIPSPARSELT_ENABLE_MARKER=OFF'
+        description: >
+          Disable hipSPARSELt's optional ROCTX marker integration. hipSPARSELt
+          defaults HIPSPARSELT_ENABLE_MARKER to ON on non-Windows builds and
+          then hard-requires roctx64/roctracer during configure, which is
+          incompatible with THEROCK_ENABLE_PROFILER=OFF.
+
+      - type: sed
+        file: "ml-libs/CMakeLists.txt"
+        marker: "-DMIOPEN_USE_ROCTRACER=OFF"
+        marker_absent: true
+        sed_command: '/-DMIOPEN_USE_COMPOSABLEKERNEL=/a\      -DMIOPEN_USE_ROCTRACER=OFF'
+        description: >
+          Disable MIOpen's optional rocTracer/ROCTX integration. MIOpen
+          enables MIOPEN_USE_ROCTRACER by default and then probes for
+          roctracer/roctx.h and roctx64 during configure, which fails when
+          THEROCK_ENABLE_PROFILER=OFF intentionally omits the profiler stack.
+
+      # 11. Disable rocBLAS ROCTX integration when profiler stack is disabled
+      - type: sed
+        file: "math-libs/BLAS/CMakeLists.txt"
+        marker: "-DROCTX=OFF"
+        marker_absent: true
+        sed_command: '0,/-DLINK_BLIS=OFF/s//-DLINK_BLIS=OFF\
+    -DROCTX=OFF/'
+        description: >
+          Disable rocBLAS's optional ROCTX integration. rocBLAS later probes
+          for roctracer headers and roctx when this path is enabled, which
+          conflicts with THEROCK_ENABLE_PROFILER=OFF where those profiler
+          components are intentionally unavailable.
+
+      - type: sed
+        file: "math-libs/BLAS/CMakeLists.txt"
+        marker: "-DBUILD_WITH_ROCTX=OFF"
+        marker_absent: true
+        sed_command: '0,/-DBUILD_CLIENTS_SAMPLES=OFF/s//-DBUILD_CLIENTS_SAMPLES=OFF\
+    -DBUILD_WITH_ROCTX=OFF/'
+        description: >
+          Disable rocSPARSE's optional ROCTX tracing path at the TheRock
+          subproject layer. rocSPARSE already guards its roctx header/library
+          probing with BUILD_WITH_ROCTX, but TheRock does not currently pass
+          that option, so profiler-disabled builds still fail in the explicit
+          find_path/find_library override.
+
+      - type: sed
+        file: "rocm-libraries/projects/rocblas/library/CMakeLists.txt"
+        marker: "if(BUILD_SHARED_LIBS)"
+        sed_command: 's|if(BUILD_SHARED_LIBS)|if(BUILD_SHARED_LIBS AND ROCTX)|'
+        description: >
+          Gate rocBLAS's shared-library ROCTX header/library probing on the
+          ROCTX cache option as well. Upstream currently probes roctracer/roctx.h
+          whenever BUILD_SHARED_LIBS is on, so TheRock still fails in
+          projects/rocblas/library/CMakeLists.txt even when -DROCTX=OFF was
+          injected at the super-project layer.
+      - type: sed
+        file: "rocm-libraries/projects/rocblas/library/CMakeLists.txt"
+        marker: 'add_compile_definitions("DISABLE_ROCTX")'
+        marker_absent: true
+        sed_command: '/--unwindlib=libgcc)/a \
+  if(NOT ROCTX)\n    add_compile_definitions("DISABLE_ROCTX")\n  endif()'
+        description: >
+          When ROCTX is explicitly disabled, still define DISABLE_ROCTX for
+          rocBLAS sources before the shared-library probe block. This keeps
+          files like logging.cpp from including roctracer/roctx.h after the
+          find_path()/find_library() probe itself has been skipped.
+
   # ---------------------------------------------------------------------------
   # Phase B: CPU Libraries + Python
   # ---------------------------------------------------------------------------
@@ -355,7 +567,7 @@ packages:
     src_dir: "aocl-utils"
     method: cmake
     phase: B
-    steps: [5]
+    steps: [6]
     depends_on: [therock]
     compiler: amdclang
     skip_marker: "lib/libaoclutils.so"
@@ -378,7 +590,7 @@ packages:
     src_dir: "aocl-libm"
     method: scons
     phase: B
-    steps: [6]
+    steps: [7]
     depends_on: [therock, aocl_utils]
     compiler: amdclang
     skip_marker: "lib/libalm.so"
@@ -443,7 +655,7 @@ packages:
     src_dir: "cpython"
     method: autoconf
     phase: B
-    steps: [7]
+    steps: [8]
     depends_on: [therock]
     compiler: amdclang
     skip_marker: "bin/python3"
@@ -468,7 +680,7 @@ packages:
     src_dir: ".venv"
     method: venv
     phase: B
-    steps: [8]
+    steps: [9]
     depends_on: [cpython]
     build_dependencies:
       - pip
@@ -482,9 +694,10 @@ packages:
       - packaging
       - mako
     notes: |
-      Virtual environment using our source-built Python 3.13.
-      If the venv exists but points to a different Python binary
-      (e.g., system python), it is recreated with our build.
+      Canonical final virtual environment using our source-built Python 3.13.
+      Step 2 creates a bootstrap venv from system python3 so early TheRock
+      build-dependency installs always happen inside a managed environment.
+      Step 9 recreates this venv with the optimized Python build when available.
 
       Essential build tools installed: pip, ninja, cmake, wheel, setuptools,
       CppHeaderParser, meson, PyYAML, packaging, mako.
@@ -503,7 +716,7 @@ packages:
     clean_generated: true
     method: pip
     phase: C
-    steps: [9, 10, 11]
+    steps: [10, 11, 12]
     depends_on: [therock, cpython]
     compiler: amdclang
     skip_marker: null
@@ -559,18 +772,29 @@ packages:
           numpy 2.x headers compile against oldest compatible API (1.20),
           producing a .so that crashes at import with numpy 2.x installed.
 
-      # 2. Remove -fclang-abi-compat=17 (ABI mismatch with amdclang 22)
+      # 2. Remove host-side -fclang-abi-compat=17 (ABI mismatch with amdclang 22)
+      - type: sed
+        file: "CMakeLists.txt"
+        marker: 'append_cxx_flag_if_supported("-fclang-abi-compat=17" CMAKE_CXX_FLAGS)'
+        sed_command: 's/append_cxx_flag_if_supported(\"-fclang-abi-compat=17\" CMAKE_CXX_FLAGS)/# Removed: causes ABI mismatch with amdclang 22/'
+        description: >
+          Remove the top-level host C++ ABI compatibility override. The ROCm
+          fork also injects -fclang-abi-compat=17 into CMAKE_CXX_FLAGS for
+          Clang >= 18, which can still leave torch host objects mangled for
+          the Clang 17 ABI and trigger unresolved symbols at import time.
+
+      # 3. Remove HIP-side -fclang-abi-compat=17 (ABI mismatch with amdclang 22)
       - type: sed
         file: "cmake/Dependencies.cmake"
         marker: "fclang-abi-compat=17"
-        sed_command: "s/list(APPEND HIP_HIPCC_FLAGS -fclang-abi-compat=17)/# Removed: causes ABI mismatch with host amdclang 22/"
+        sed_command: "s/[[:space:]]-fclang-abi-compat=17//g"
         description: >
           Remove -fclang-abi-compat=17 from HIPCC flags. PyTorch adds it
           for compat with newer hip-clang C++20 mangling rules, but it
           forces HIP device code to use Clang 17 ABI while host code uses
           amdclang 22 ABI, causing undefined symbol errors.
 
-      # 3. Add gfx1151 to CK GEMM supported architectures
+      # 4. Add gfx1151 to CK GEMM supported architectures
       - type: sed
         file: "aten/src/ATen/Context.cpp"
         marker: "gfx1151"
@@ -582,7 +806,7 @@ packages:
           architecture!" and TunableOp cannot include CK kernels in its
           autotuning candidates. The gate is a hardcoded vector of arch strings.
 
-      # 4. Remove HIPGraph.hip dead code (CUDA 12.4+ type with no HIP equivalent)
+      # 5. Remove HIPGraph.hip dead code (CUDA 12.4+ type with no HIP equivalent)
       - type: file_rewrite
         file: "aten/src/ATen/hip/HIPGraph.hip"
         marker: "cudaGraphConditionalHandle"
@@ -595,41 +819,33 @@ packages:
           minimal stub containing only the namespace declaration.
         note: "Content is a heredoc in build-vllm.sh (too complex for YAML inline)"
 
-      # 5. Wheel RPATH: fix build tree paths in torch/lib/*.so
+      # 5. Wheel RPATH: normalize torch/lib/*.so search path
       - type: patchelf_rpath
         target: "torch/lib/lib*.so"
-        condition: "RUNPATH contains 'pytorch/build'"
-        rpath: "${LOCAL_PREFIX}/lib:$ORIGIN"
+        rpath: "${LOCAL_PREFIX}/lib:${LOCAL_PREFIX}/lib/llvm/lib:$ORIGIN"
         action: set
         description: >
-          Fix RPATHs inside PyTorch wheel. cmake bakes build tree path
-          (e.g. /opt/src/vllm/pytorch/build/lib) into RUNPATH, causing
-          the dynamic linker to load unpatched .so files from the build
-          tree instead of the wheel's copies.
+          Normalize every torch/lib/*.so RPATH inside the PyTorch wheel.
+          cmake can leak the build tree path (e.g.
+          /opt/src/vllm/pytorch/build/lib) into RUNPATH, causing the
+          dynamic linker to mix build-tree and installed wheel
+          libraries. Replacing it with only the local runtime dirs and
+          $ORIGIN keeps torch's shared libraries self-consistent and
+          also makes clang's OpenMP runtime resolvable without
+          LD_LIBRARY_PATH.
 
-      # 6. Wheel RPATH: add ROCm lib path to .so files that reference ROCm libs
-      - type: patchelf_rpath
-        target: "torch/lib/lib*.so"
-        condition: "NEEDED contains libalm.so, libamdhip64, or librocm_smi"
-        rpath: "${LOCAL_PREFIX}/lib"
-        action: add
-        description: >
-          Add ROCm lib path to .so files that dynamically link ROCm
-          libraries (libalm.so, libamdhip64, librocm_smi64) so they
-          resolve without LD_LIBRARY_PATH at runtime.
-
-      # 7. Wheel RPATH: fix _C extension module build tree path
+      # 6. Wheel RPATH: normalize torch/_C*.so search path
       - type: patchelf_rpath
         target: "torch/_C*.so"
-        condition: "RUNPATH contains 'pytorch/build'"
-        rpath: "${LOCAL_PREFIX}/lib:$ORIGIN/lib"
+        rpath: "${LOCAL_PREFIX}/lib:${LOCAL_PREFIX}/lib/llvm/lib:$ORIGIN/lib"
         action: set
         description: >
-          Fix the _C extension module RPATH. Same build tree path issue
-          as torch/lib/*.so but needs $ORIGIN/lib to find sibling .so
-          files in the wheel's lib/ subdirectory.
+          Normalize the _C extension module RPATH. It has the same
+          build-tree leakage risk as torch/lib/*.so, but also needs
+          $ORIGIN/lib to find sibling torch libraries in the wheel's
+          lib/ subdirectory.
 
-      # 8. Wheel NEEDED: add librocm_smi64.so to libtorch_hip.so
+      # 7. Wheel NEEDED: add librocm_smi64.so to libtorch_hip.so
       - type: patchelf_needed
         target: "torch/lib/libtorch_hip.so"
         library: "librocm_smi64.so"
@@ -640,12 +856,24 @@ packages:
           symbols -- upstream bug that causes "undefined symbol: rsmi_init"
           at runtime.
 
+      # 8. Wheel NEEDED: add clang OpenMP runtime to torch._C extension
+      - type: patchelf_needed
+        target: "torch/_C*.so"
+        library: "libomp.so or libiomp5.so from ${LOCAL_PREFIX}/lib{,/llvm/lib}"
+        condition: "NEEDED does not contain an OpenMP runtime"
+        description: >
+          Add clang's OpenMP runtime to the torch._C extension when the
+          wheel omits it. This ensures libomp/libiomp5 is loaded at
+          import time without mutating libtorch_cpu.so itself, avoiding
+          the original "__kmpc_fork_call" failure while keeping torch's
+          internal library dependency graph unchanged.
+
   torchvision:
     repo: "https://github.com/pytorch/vision.git"
     src_dir: "torchvision"
     method: pip
     phase: C
-    steps: [12, 13]
+    steps: [13, 14]
     depends_on: [pytorch]
     compiler: amdclang
     skip_marker: null
@@ -674,7 +902,7 @@ packages:
     validate_remote: "ROCm/triton"
     method: pip
     phase: D
-    steps: [14, 15, 16]
+    steps: [15, 16, 17]
     depends_on: [therock, pytorch]
     compiler: amdclang
     skip_marker: null
@@ -750,7 +978,7 @@ packages:
     src_dir: "aotriton"
     method: cmake
     phase: D
-    steps: [17, 18]
+    steps: [18, 19]
     depends_on: [triton]
     compiler: amdclang
     skip_marker: "lib/libaotriton_v2.so"
@@ -779,9 +1007,10 @@ packages:
   vllm:
     repo: "https://github.com/vllm-project/vllm.git"
     src_dir: "vllm"
+    clean_generated: true
     method: pip
     phase: E
-    steps: [19, 20, 21, 22, 23, 24]
+    steps: [20, 21, 22, 23, 24, 25]
     depends_on: [pytorch, triton, aotriton]
     compiler: amdclang
     skip_marker: null
@@ -937,24 +1166,7 @@ packages:
           to raise "RuntimeError: Duplicate pattern" and crash the engine.
           This prevents torch.compile from working, forcing --enforce-eager.
 
-      # 10. Triton sampler bypass: gfx1151 page fault after torch.compile AOT
-      - type: sed
-        file: "vllm/v1/sample/ops/topk_topp_sampler.py"
-        marker: "NOTE(gfx1151)"
-        marker_absent: true
-        sed_command: >
-          /if HAS_TRITON and logits.shape\[0\] >= 8:/,+2{
-            s|    if HAS_TRITON.*|    # NOTE(gfx1151): The Triton top-k/top-p kernel page-faults on RDNA 3.5\n    # after torch.compile AOT compilation. Use the PyTorch sort path instead.\n    # if HAS_TRITON and logits.shape[0] >= 8:\n    #     return apply_top_k_top_p_triton(logits, k, p)|;
-            /return apply_top_k_top_p_triton/d
-          }
-        description: >
-          Comment out the Triton top-k/top-p sampler kernel path. On gfx1151,
-          the Triton kernel page-faults after torch.compile AOT compilation
-          has rewritten the sampling graph. The PyTorch sort-based path
-          (apply_top_k_top_p_pytorch) is functionally identical and works
-          correctly on all architectures.
-
-      # 11. FLA chunk_delta_h: AMD autotune restrict + exp() float32 cast
+      # 10. FLA chunk_delta_h: AMD autotune restrict + exp() float32 cast
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
         marker: "is_amd"
@@ -964,7 +1176,7 @@ packages:
           Import is_amd flag from utils for conditional autotune configuration
           in chunk_delta_h.py. Part 1 of 3 for the FLA AMD fixes.
 
-      # 12. FLA chunk_delta_h: restrict autotune search on AMD
+      # 11. FLA chunk_delta_h: restrict autotune search on AMD
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
         marker: "if is_amd else"
@@ -978,7 +1190,7 @@ packages:
           pipeline stages cause GPU page faults during autotuning on RDNA 3.5
           (gfx1151, wave32). The CDNA path (gfx9) retains the full search.
 
-      # 13. FLA chunk_delta_h: restrict BV autotune on AMD
+      # 12. FLA chunk_delta_h: restrict BV autotune on AMD
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
         marker: "\\[32\\] if is_amd"
@@ -988,7 +1200,7 @@ packages:
           Restrict Triton autotune BV to 32 on AMD HIP. BV=64 with K>64
           produces kernels that page-fault on RDNA 3.5 during autotuning.
 
-      # 14. FLA chunk_delta_h: cast exp() operands to float32 on HIP
+      # 13. FLA chunk_delta_h: cast exp() operands to float32 on HIP
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
         marker: "b_g_diff"
@@ -1003,7 +1215,7 @@ packages:
           correctly for exp(scalar_bf16 - block_ptr_load_bf16), producing
           invalid IR. Explicit float32 cast also improves precision.
 
-      # 15. FLA chunk_delta_h: cast b_g_last to float32 in second exp()
+      # 14. FLA chunk_delta_h: cast b_g_last to float32 in second exp()
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_delta_h.py"
         marker: "b_g_last.to(tl.float32))"
@@ -1013,7 +1225,7 @@ packages:
           Cast b_g_last to float32 before the second exp() call in
           chunk_delta_h. Same type inference issue as patch 14.
 
-      # 16. FLA qwen3_next warmup: restrict to T=(64,)
+      # 15. FLA qwen3_next warmup: restrict to T=(64,)
       - type: sed
         file: "vllm/model_executor/models/qwen3_next.py"
         marker: "NOTE(gfx1151)"
@@ -1028,7 +1240,7 @@ packages:
           This only affects the warmup path -- actual inference always uses
           T >= chunk_size for prefill and the chunk loop for decode.
 
-      # 17. Rotary embedding: flash_attn import try/except
+      # 16. Rotary embedding: flash_attn import try/except
       - type: sed
         file: "vllm/model_executor/layers/rotary_embedding/common.py"
         marker: "flash_attn may be installed"
@@ -1045,7 +1257,7 @@ packages:
           flash_attn_2_cuda) fails with ImportError. The fallback is vLLM's
           own rotary implementation which works on all platforms.
 
-      # 18. AITER RMSNorm: Triton dispatch for gfx1x (fused_add variant)
+      # 17. AITER RMSNorm: Triton dispatch for gfx1x (fused_add variant)
       - type: file_rewrite
         file: "vllm/_aiter_ops.py"
         marker: "rmsnorm2d_fwd_with_add_dynamicquant"
@@ -1060,7 +1272,7 @@ packages:
           Complex multi-line replacement handled in build-vllm.sh with
           Python script (too complex for YAML sed expression).
 
-      # 19. AITER RMSNorm: Triton dispatch for gfx1x (plain variant)
+      # 18. AITER RMSNorm: Triton dispatch for gfx1x (plain variant)
       - type: file_rewrite
         file: "vllm/_aiter_ops.py"
         marker: "rmsnorm2d_fwd_with_dynamicquant"
@@ -1072,7 +1284,7 @@ packages:
           Applied together with patch 18 by the same Python script in
           build-vllm.sh.
 
-      # 20. FLA chunk_o.py: add is_amd import
+      # 19. FLA chunk_o.py: add is_amd import
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_o.py"
         marker: "is_amd"
@@ -1082,7 +1294,7 @@ packages:
           Add is_amd to the utils import in chunk_o.py. Required by patches
           21-23 which restrict autotune parameters on AMD HIP.
 
-      # 21. FLA chunk_o.py: restrict BK autotune on AMD
+      # 20. FLA chunk_o.py: restrict BK autotune on AMD
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_o.py"
         marker: "32\\] if is_amd else BKV_LIST"
@@ -1093,7 +1305,7 @@ packages:
           kernel page-faults during autotuning on RDNA 3.5 with BK>32 and
           num_stages>2. Same class of fix as chunk_delta_h patches 13-15.
 
-      # 22. FLA chunk_o.py: restrict BV autotune on AMD
+      # 21. FLA chunk_o.py: restrict BV autotune on AMD
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_o.py"
         marker: "32\\] if is_amd else BKV_LIST"
@@ -1104,7 +1316,7 @@ packages:
           patch 21 — large tile sizes produce code that causes GPU page faults
           during autotuning on RDNA 3.5 (wave32).
 
-      # 23. FLA chunk_o.py: restrict num_stages autotune on AMD
+      # 22. FLA chunk_o.py: restrict num_stages autotune on AMD
       - type: sed
         file: "vllm/model_executor/layers/fla/ops/chunk_o.py"
         marker: "\\[2\\] if is_amd"
@@ -1114,7 +1326,7 @@ packages:
           Restrict Triton autotune num_stages to 2 on AMD HIP. Higher pipeline
           stages produce code that page-faults on RDNA 3.5 during autotuning.
 
-      # 24. config/vllm.py: re-run hybrid alignment after platform config
+      # 23. config/vllm.py: re-run hybrid alignment after platform config
       - type: file_rewrite
         file: "vllm/config/vllm.py"
         marker: "Re-run hybrid alignment"
@@ -1129,7 +1341,7 @@ packages:
           Complex multi-line insertion handled in build-vllm.sh with
           Python script (too complex for YAML sed expression).
 
-      # 25. models/config.py: platform block_size as alignment minimum
+      # 24. models/config.py: platform block_size as alignment minimum
       - type: file_rewrite
         file: "vllm/model_executor/models/config.py"
         marker: "platform already set a minimum"
@@ -1146,7 +1358,7 @@ packages:
           Complex multi-line insertion handled in build-vllm.sh with
           Python script (too complex for YAML sed expression).
 
-      # 26. rocm.py: skip AITER attention backends for hybrid models [TESTING]
+      # 25. rocm.py: skip AITER attention backends for hybrid models [TESTING]
       - type: file_rewrite
         file: "vllm/platforms/rocm.py"
         marker: "_is_hybrid"
@@ -1162,7 +1374,7 @@ packages:
           Complex multi-line insertion handled in build-vllm.sh with
           Python script (too complex for YAML sed expression).
 
-      # 27. rocm_aiter_unified_attn.py: power-of-2 block_size check [TESTING]
+      # 26. rocm_aiter_unified_attn.py: power-of-2 block_size check [TESTING]
       - type: file_rewrite
         file: "vllm/v1/attention/backends/rocm_aiter_unified_attn.py"
         marker: "block_size - 1"
@@ -1188,7 +1400,7 @@ packages:
     src_dir: "flash-attention"
     method: pip
     phase: F
-    steps: [25, 26, 27, 28]
+    steps: [26, 27, 28, 29]
     depends_on: [pytorch, triton, vllm]
     compiler: amdclang
     skip_marker: null
@@ -1231,7 +1443,7 @@ packages:
     src_dir: "pytorch/third_party/aiter"
     method: pip
     phase: F
-    steps: [28]
+    steps: [29]
     depends_on: [pytorch, vllm]
     compiler: amdclang
     skip_marker: null
@@ -1344,7 +1556,7 @@ packages:
   rust_wheels:
     method: cargo
     phase: H
-    steps: [30]
+    steps: [31]
     depends_on: [cpython]
     notes: |
       Builds and installs orjson and cryptography from source with Rust flags:
@@ -1365,7 +1577,7 @@ packages:
   native_wheels:
     method: pip
     phase: H
-    steps: [31]
+    steps: [32]
     depends_on: [cpython, pytorch]
     notes: |
       Builds and installs numpy, sentencepiece, zstandard, asyncpg, duckdb from
@@ -1393,7 +1605,7 @@ packages:
   source_wheels:
     method: export
     phase: H
-    steps: [32]
+    steps: [33]
     depends_on: [pytorch, triton, torchvision, vllm]
     notes: |
       Packages torch, triton, torchvision, amd-aiter, amdsmi as
@@ -1414,7 +1626,7 @@ packages:
     shallow: true
     method: cmake
     phase: I
-    steps: [33]
+    steps: [34]
     depends_on: [therock]
     compiler: amdclang
     skip_marker: null
@@ -1471,7 +1683,7 @@ packages:
     shallow: true
     method: pip
     phase: I
-    steps: [33, 34, 35]
+    steps: [34, 35, 36]
     depends_on: [therock, llamacpp]
     compiler: system
     skip_marker: null

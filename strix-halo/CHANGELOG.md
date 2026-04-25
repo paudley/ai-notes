@@ -33,7 +33,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CDNA-only modules with failure reasons (async LDS DMA, packed FP8, wave64
   static_assert, backward codegen, etc.). Maintainable — remove entries if
   upstream AITER adds gfx1151 support.
-- **Backend smoke test** (step 36): Downloads SmolLM2-135M-Instruct (~270 MB
+- **Backend smoke test** (step 37): Downloads SmolLM2-135M-Instruct (~270 MB
   FP16, ~70 MB Q4 GGUF) and runs actual inference through all five backends:
   vLLM, llama.cpp ROCm, llama.cpp Vulkan, Lemonade SDK, and Ollama.
   TunableOp GEMM warmup occurs as a side effect of the vLLM test, so the
@@ -61,14 +61,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **YAML-driven build pipeline**: All 36 build steps across 10 phases (A–J)
+- **YAML-driven build pipeline**: All 37 build steps across 10 phases (A–J)
   are now orchestrated from `vllm-packages.yaml`. Repository URLs, branches,
   patches, build flags, and prerequisites are declared in YAML and read at
   runtime via `yq`. The build script is a generic executor, not a hardcoded
   sequence.
 - **TunableOp warmup absorbed into smoke test**: The standalone
   `warmup_tunableop()` (former step 29c) is replaced by the backend smoke
-  test (step 36). TunableOp CSV is populated as a side effect of vLLM
+  test (step 37). TunableOp CSV is populated as a side effect of vLLM
   inference — no `.env` file or pre-configured model required.
 - **Prerequisites section** in `vllm-packages.yaml` restructured with per-distro
   `install_commands` map (arch, ubuntu, fedora) instead of a single Arch-only
@@ -140,9 +140,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   speedup (137 -> 1060 tok/s on Qwen2.5-0.5B).
 - **Duplicate pattern registration crash** (BUILD-FIXES.md #39): AITER fusion
   pass registered identical patterns, fixed with `skip_duplicates=True`.
-- **Triton sampler page fault** (BUILD-FIXES.md #41): Triton top-k/top-p kernel
-  page-faults on gfx1151 after torch.compile AOT. Bypassed to PyTorch
-  sort-based path.
+- **Triton sampler page fault** (BUILD-FIXES.md #41): Reframed as a
+  build-specific stack-compatibility issue (not a universal gfx1151 rule).
+  Removed the blanket sampler-bypass patch from the YAML patch set so
+  Triton sampler remains enabled by default.
 - **FLA autotuner page faults** (BUILD-FIXES.md #42, #49): Restricted AMD
   autotuning to `num_stages=2`, `BV=32` to stay within RDNA 3.5 register
   pressure limits.
