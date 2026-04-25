@@ -861,6 +861,7 @@ apply_patches() {
                         continue
                     fi
                     info "  [${i}] ${p_description}"
+                    mkdir -p "$(dirname "${p_dst}")"
                     if [[ "${p_recursive}" == "true" ]]; then
                         cp -a "${p_src}" "${p_dst}"
                     else
