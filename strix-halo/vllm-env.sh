@@ -386,7 +386,15 @@ if [[ -d "${_LLAMACPP_VULKAN}" ]]; then
     export LEMONADE_LLAMACPP_VULKAN_DIR="${_LLAMACPP_VULKAN}"
     export LD_LIBRARY_PATH="${_LLAMACPP_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
-unset _LLAMACPP_ROCM _LLAMACPP_VULKAN
+
+# stable-diffusion.cpp Vulkan backend (image generation)
+_STABLE_DIFFUSION_VULKAN="${VLLM_VENV}/vulkan/stable_diffusion"
+if [[ -d "${_STABLE_DIFFUSION_VULKAN}" ]]; then
+    export STABLE_DIFFUSION_CPP_DIR="${_STABLE_DIFFUSION_VULKAN}"
+    export PATH="${_STABLE_DIFFUSION_VULKAN}:${PATH}"
+    export LD_LIBRARY_PATH="${_STABLE_DIFFUSION_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+unset _LLAMACPP_ROCM _LLAMACPP_VULKAN _STABLE_DIFFUSION_VULKAN
 
 # =============================================================================
 # Virtual Environment Activation
@@ -475,6 +483,11 @@ if [[ "${1:-}" == "--info" ]]; then
     else
         echo "    Vulkan .env:      not found"
     fi
+    echo ""
+    echo "  stable-diffusion.cpp:"
+    echo "    Vulkan backend:   ${STABLE_DIFFUSION_CPP_DIR:-<not built>}"
+    echo "    sd-cli:           $(command -v sd-cli 2>/dev/null || echo 'not in PATH')"
+    echo "    sd-server:        $(command -v sd-server 2>/dev/null || echo 'not in PATH')"
     echo ""
     echo "  Runtime:"
     echo "    VENV active:      $(command -v python 2>/dev/null || echo 'no')"
