@@ -89,7 +89,7 @@ platform:
 
 build:
   vllm_dir: "/opt/src/vllm"
-  total_steps: 37
+  total_steps: 38
   cpython_version: "3.13.12"
   disk_required_gb: 100
   clang_min_version: 21
@@ -236,11 +236,12 @@ steps:
 
   # Phase I: Lemonade Inference Server
   34: clone_and_build_lemonade
-  35: install_lemonade_sdk
-  36: validate_lemonade
+  35: clone_and_build_stable_diffusion
+  36: install_lemonade_sdk
+  37: validate_lemonade
 
   # Phase J: Backend Smoke Test (all inference backends)
-  37: backend_smoke_test
+  38: backend_smoke_test
 
 # =============================================================================
 # Packages: per-component metadata (repos, patches, build notes)
@@ -1714,3 +1715,46 @@ packages:
       - "python -c 'import lemonade'"
       - "test -x ${VLLM_VENV}/rocm/llama_server/llama-server"
       - "test -x ${VLLM_VENV}/vulkan/llama_server/llama-server"
+
+  stable_diffusion_cpp:
+    repo: "https://github.com/leejet/stable-diffusion.cpp.git"
+    branch: "master"
+    recursive: true
+    src_dir: "vendor/stable-diffusion.cpp"
+    method: cmake
+    phase: I
+    steps: [35, 37]
+    depends_on: [therock]
+    compiler: amdclang
+    skip_marker: null
+    backend:
+      install_dir: "${VLLM_VENV}/vulkan/stable_diffusion"
+      build_dir: "build-vulkan"
+      cmake_flags:
+        SD_VULKAN: "ON"
+        SD_BUILD_EXAMPLES: "ON"
+        SD_BUILD_SHARED_LIBS: "OFF"
+        SD_WEBP: "ON"
+        SD_WEBM: "ON"
+        GGML_NATIVE: "ON"
+        GGML_OPENMP: "ON"
+        GGML_CCACHE: "ON"
+        GGML_VULKAN_CHECK_RESULTS: "OFF"
+        GGML_VULKAN_VALIDATE: "OFF"
+        GGML_VULKAN_DEBUG: "OFF"
+    binaries:
+      - sd-cli
+      - sd-server
+    notes: |
+      stable-diffusion.cpp built from upstream master with recursive ggml and
+      media submodules. The gfx1151 path uses the Vulkan backend because it is
+      the most practical Strix Halo image-generation backend: it avoids ROCm
+      device support gaps while still using the iGPU and unified memory.
+
+      Build options mirror the validated /opt/src/vllm/vendor build:
+      amdclang from TheRock, Zen 5 native CPU flags, ThinLTO, AOCL-LibM RPATH,
+      OpenMP CPU backend, WebP/WebM output support, and static stable-diffusion
+      libraries with standalone sd-cli/sd-server binaries.
+    validation:
+      - "test -x ${VLLM_VENV}/vulkan/stable_diffusion/sd-cli"
+      - "test -x ${VLLM_VENV}/vulkan/stable_diffusion/sd-server"

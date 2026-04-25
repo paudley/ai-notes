@@ -29,7 +29,7 @@
 #   scripts/build-vllm.sh --rebuild   # Force rebuild (clean + build)
 #   scripts/build-vllm.sh --step N    # Run from step N onward
 #
-# Build pipeline (37 steps):
+# Build pipeline (38 steps):
 #   Phase A: ROCm SDK (TheRock — builds amdclang used by everything downstream)
 #     1. Clone TheRock          4. Build TheRock
 #     2. Create bootstrap venv  5. Validate ROCm
@@ -73,11 +73,12 @@
 #
 #   Phase I: Lemonade Inference Server (llama.cpp + FLM + ONNX)
 #    34. Clone Lemonade + build llama.cpp with hipBLAS for gfx1151
-#    35. Install Lemonade SDK from PyPI (lemonade-sdk)
-#    36. Validate Lemonade (server smoke test)
+#    35. Clone/build stable-diffusion.cpp with Vulkan for gfx1151
+#    36. Install Lemonade SDK from PyPI (lemonade-sdk)
+#    37. Validate Lemonade + stable-diffusion.cpp
 #
 #   Phase J: Backend Smoke Test
-#    37. Backend smoke test (all inference backends)
+#    38. Backend smoke test (all inference backends)
 
 set -euo pipefail
 
@@ -314,11 +315,13 @@ TORCHVISION_SRC="${VLLM_DIR}/$(pkg torchvision src_dir)"
 FLASH_ATTN_SRC="${VLLM_DIR}/$(pkg flash_attention src_dir)"
 LEMONADE_SRC="${VLLM_DIR}/$(pkg lemonade src_dir)"
 LLAMACPP_SRC="${VLLM_DIR}/$(pkg llamacpp src_dir)"
+STABLE_DIFFUSION_SRC="${VLLM_DIR}/$(pkg stable_diffusion_cpp src_dir)"
 
 # Lemonade backend install directories
 LLAMACPP_ROCM_DIR="${VLLM_VENV}/rocm/llama_server"
 LLAMACPP_VULKAN_DIR="${VLLM_VENV}/vulkan/llama_server"
 LLAMACPP_INSTALL_DIR="${LLAMACPP_ROCM_DIR}"
+STABLE_DIFFUSION_VULKAN_DIR="${VLLM_VENV}/vulkan/stable_diffusion"
 
 # Wheel output directory
 WHEELS_DIR="${VLLM_DIR}/wheels"
@@ -4012,7 +4015,7 @@ if failed > 0:
     success "AITER JIT pre-warm: ${built_count} modules compiled in ${jit_dir}"
 }
 
-# Step 37: Backend Smoke Test
+# Step 38: Backend Smoke Test
 # Downloads a tiny model (SmolLM2-135M-Instruct, ~270 MB FP16 / ~70 MB Q4 GGUF)
 # and runs actual inference through every installed backend:
 #   1. vLLM      – offline LLM inference + TunableOp CSV warmup as side effect
@@ -4025,7 +4028,7 @@ if failed > 0:
 # Individual backend failures are non-fatal — a summary table is printed at
 # the end showing PASS / FAIL / SKIP for each backend.
 backend_smoke_test() {
-    log_step 37 "Backend smoke test (all inference backends)"
+    log_step 38 "Backend smoke test (all inference backends)"
 
     # ── Load .env overrides (e.g. SMOKE_SKIP_VLLM=1) ──────────────────
     # Supported skip variables:
@@ -5058,8 +5061,89 @@ clone_and_build_lemonade() {
     success "Both ROCm and Vulkan backends ready for Lemonade"
 }
 
+clone_and_build_stable_diffusion() {
+    log_step 35 "Clone and build stable-diffusion.cpp with Vulkan"
+
+    clone_pkg stable_diffusion_cpp "${STABLE_DIFFUSION_SRC}" "stable-diffusion.cpp"
+
+    local _build_dir="${STABLE_DIFFUSION_SRC}/build-vulkan"
+
+    if [[ -x "${_build_dir}/bin/sd-cli" && -x "${_build_dir}/bin/sd-server" ]]; then
+        info "stable-diffusion.cpp Vulkan already built at ${_build_dir}/bin"
+    else
+        info "Building stable-diffusion.cpp with Vulkan backend..."
+
+        local _cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+        local _cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
+
+        local _cpu_flags
+        if [[ ! -x "${_cc}" ]]; then
+            warn "TheRock amdclang not found at ${_cc}, falling back to system clang"
+            _cc="clang"
+            _cxx="clang++"
+            _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -Wno-error=unused-command-line-argument"
+        else
+            _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+        fi
+
+        local _link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
+
+        cmake -B "${_build_dir}" -S "${STABLE_DIFFUSION_SRC}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="${_cc}" \
+            -DCMAKE_CXX_COMPILER="${_cxx}" \
+            -DCMAKE_C_FLAGS="${_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS="${_cpu_flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${_link_flags}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${_link_flags}" \
+            -DSD_VULKAN=ON \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_WEBP=ON \
+            -DSD_WEBM=ON \
+            -DGGML_NATIVE=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=ON \
+            -DGGML_VULKAN_CHECK_RESULTS=OFF \
+            -DGGML_VULKAN_VALIDATE=OFF \
+            -DGGML_VULKAN_DEBUG=OFF
+
+        cmake --build "${_build_dir}" --config Release -j "$(nproc)"
+        success "stable-diffusion.cpp Vulkan build complete"
+    fi
+
+    mkdir -p "${STABLE_DIFFUSION_VULKAN_DIR}"
+
+    local _binaries=(sd-cli sd-server)
+    for _bin in "${_binaries[@]}"; do
+        if [[ -x "${_build_dir}/bin/${_bin}" ]]; then
+            cp -f "${_build_dir}/bin/${_bin}" "${STABLE_DIFFUSION_VULKAN_DIR}/${_bin}"
+            info "Installed ${_bin} -> ${STABLE_DIFFUSION_VULKAN_DIR}/${_bin}"
+        else
+            warn "${_bin} not found in stable-diffusion.cpp build output"
+        fi
+    done
+
+    if command -v patchelf >/dev/null 2>&1; then
+        for _bin in "${_binaries[@]}"; do
+            [[ -x "${STABLE_DIFFUSION_VULKAN_DIR}/${_bin}" ]] || continue
+            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${STABLE_DIFFUSION_VULKAN_DIR}" \
+                "${STABLE_DIFFUSION_VULKAN_DIR}/${_bin}"
+        done
+        info "RPATH fixed for stable-diffusion.cpp binaries"
+    fi
+
+    local _sd_version
+    _sd_version="$(cd "${STABLE_DIFFUSION_SRC}" && git describe --tags --always 2>/dev/null || echo "master")"
+    echo "${_sd_version}" > "${STABLE_DIFFUSION_VULKAN_DIR}/version.txt"
+    echo "vulkan" > "${STABLE_DIFFUSION_VULKAN_DIR}/backend.txt"
+
+    success "stable-diffusion.cpp Vulkan installed at ${STABLE_DIFFUSION_VULKAN_DIR}"
+}
+
 install_lemonade_sdk() {
-    log_step 35 "Install Lemonade SDK"
+    log_step 36 "Install Lemonade SDK"
 
     # The Lemonade project split in v10: the git repo (v10.0.0) is a C++ server,
     # while the Python SDK is published separately as lemonade-sdk on PyPI (v9.1.4).
@@ -5127,7 +5211,7 @@ print(f'  llama-server (vulkan): {path}')
 }
 
 validate_lemonade() {
-    log_step 36 "Validate Lemonade installation"
+    log_step 37 "Validate Lemonade and stable-diffusion.cpp installation"
 
     # Check llama-server binary
     if [[ ! -x "${LLAMACPP_INSTALL_DIR}/llama-server" ]]; then
@@ -5217,7 +5301,25 @@ assert importlib.util.find_spec('lemonade') or importlib.util.find_spec('lemonad
         warn "Only ROCm backend available — Vulkan will not be usable for >32K context"
     fi
 
-    success "Lemonade validation complete (ROCm + Vulkan)"
+    # --- Validate stable-diffusion.cpp Vulkan backend ---
+    info "Checking stable-diffusion.cpp Vulkan backend..."
+    if [[ -x "${STABLE_DIFFUSION_VULKAN_DIR}/sd-cli" ]]; then
+        success "sd-cli (vulkan): ${STABLE_DIFFUSION_VULKAN_DIR}/sd-cli"
+        "${STABLE_DIFFUSION_VULKAN_DIR}/sd-cli" -h >/dev/null 2>&1 \
+            || warn "sd-cli help check returned non-zero"
+        if [[ -f "${STABLE_DIFFUSION_VULKAN_DIR}/version.txt" ]]; then
+            info "stable-diffusion.cpp version: $(cat "${STABLE_DIFFUSION_VULKAN_DIR}/version.txt")"
+        fi
+    else
+        warn "sd-cli not found at ${STABLE_DIFFUSION_VULKAN_DIR}/sd-cli"
+    fi
+    if [[ -x "${STABLE_DIFFUSION_VULKAN_DIR}/sd-server" ]]; then
+        success "sd-server (vulkan): ${STABLE_DIFFUSION_VULKAN_DIR}/sd-server"
+    else
+        warn "sd-server not found at ${STABLE_DIFFUSION_VULKAN_DIR}/sd-server"
+    fi
+
+    success "Lemonade validation complete (ROCm + Vulkan + stable-diffusion.cpp)"
 }
 
 # =============================================================================

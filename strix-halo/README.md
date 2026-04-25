@@ -120,11 +120,12 @@ Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
 
 Phase I: Lemonade Inference Server
   34. Clone Lemonade + build llama.cpp (ROCm hipBLAS + Vulkan backends)
-  35. Install Lemonade SDK from PyPI
-  36. Validate Lemonade (both backends)
+  35. Clone/build stable-diffusion.cpp (Vulkan backend)
+  36. Install Lemonade SDK from PyPI
+  37. Validate Lemonade + stable-diffusion.cpp
 
 Phase J: Backend Smoke Test
-  37. Validate all inference backends with SmolLM2
+  38. Validate all inference backends with SmolLM2
 ```
 
 ### Lemonade: Dual-Backend llama.cpp
@@ -141,6 +142,14 @@ two GPU backends, managed by the
 Both backends are installed into the venv and Lemonade can route between
 them based on workload. Each backend gets its own `.env` file with
 gfx1151 runtime optimizations (batch sizing, hipBLASLt, THP).
+
+### stable-diffusion.cpp: Vulkan Image Generation
+
+Phase I also builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+from upstream `master` with the Vulkan backend for Strix Halo image generation.
+The build uses TheRock `amdclang`, Zen 5 native CPU flags, ThinLTO, AOCL-LibM,
+OpenMP, WebP/WebM support, and installs `sd-cli`/`sd-server` into
+`${VLLM_VENV}/vulkan/stable_diffusion`.
 
 ## Supported Distributions
 
@@ -250,7 +259,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 
 | File | Description |
 |------|-------------|
-| `build-vllm.sh` | Master build script (37-step pipeline) |
+| `build-vllm.sh` | Master build script (38-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
 | `vllm-packages.yaml` | Package manifest (repos, branches, patches, per-distro prerequisites, bootstrap config) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
@@ -278,6 +287,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 | AOCL-LibM | amd/aocl-libm-ose | main |
 | AOCL-Utils | amd/aocl-utils | main |
 | llama.cpp | ggml-org/llama.cpp | master |
+| stable-diffusion.cpp | leejet/stable-diffusion.cpp | master |
 | Lemonade | lemonade-sdk/lemonade | v10.0.0 |
 
 Note: PyTorch, Triton, and Flash Attention use the **ROCm forks**, not
