@@ -89,7 +89,7 @@ platform:
 
 build:
   vllm_dir: "/opt/src/vllm"
-  total_steps: 38
+  total_steps: 40
   cpython_version: "3.13.12"
   disk_required_gb: 100
   clang_min_version: 21
@@ -226,8 +226,8 @@ steps:
   28: patch_flash_amdsmi
   29: [build_flash_attention, rebuild_aiter, patch_aiter_gfx1151]
 
-  # Phase G: Validation + Warmup
-  30: [smoke_test, warmup_aiter_jit]
+  # Phase G: Validation
+  30: smoke_test
 
   # Phase H: Optimized Wheels
   31: build_rust_wheels
@@ -240,8 +240,12 @@ steps:
   36: install_lemonade_sdk
   37: validate_lemonade
 
-  # Phase J: Backend Smoke Test (all inference backends)
+  # Phase J: Backend Smoke Test + Benchmarks
   38: backend_smoke_test
+  39: benchmark_optimized_backends
+
+  # Phase K: Deferred JIT Warmup
+  40: warmup_aiter_jit
 
 # =============================================================================
 # Packages: per-component metadata (repos, patches, build notes)
@@ -262,10 +266,10 @@ packages:
     steps: [1, 3, 4, 5]
     depends_on: []
     compiler: gcc
-    skip_marker: "lib/libamdhip64.so"
+    skip_marker: "lib/libhipsparselt.so"
     skip_check:
       type: file_exists
-      path: "lib/libamdhip64.so"
+      path: "lib/libhipsparselt.so"
     build_dependencies:
       - joblib
       - msgpack
@@ -273,6 +277,7 @@ packages:
       - pandas
       - pyyaml
       - pytest
+      - zstandard
     notes: |
       TheRock MUST be built with GCC -- rocprofiler-systems has an explicit
       GNU compiler check that blocks Clang. TheRock produces amdclang (AMD's
@@ -475,6 +480,19 @@ packages:
           definition. Several sources use that macro through core.h, so once
           nvtx.h honors NVTX_NO_IMPL the stub path must also provide the same
           API surface.
+
+      # 9d. Add missing <map> include required by newer RCCL net transport code
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/transport/net.cc"
+        marker: "#include <map>"
+        marker_absent: true
+        sed_command: |-
+          /#include <mutex>/a\
+          #include <map>
+        description: >
+          Add the missing standard library header for std::map in RCCL's net
+          transport source. Current Clang/libc++ no longer pulls it in
+          transitively, so the hipified net_tmp.cc compilation fails.
 
       # 10. Disable hipBLASLt ROCTX marker support when profiler stack is disabled
       - type: sed
@@ -1535,7 +1553,11 @@ packages:
           with a non-standard block_size.
 
   # ---------------------------------------------------------------------------
-  # Phase G: Build Validation + AITER JIT Pre-warm (no patches)
+  # Phase G: Build Validation (no patches)
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Phase K: Deferred AITER JIT Pre-warm (no patches)
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
@@ -1560,7 +1582,8 @@ packages:
     steps: [31]
     depends_on: [cpython]
     notes: |
-      Builds and installs orjson and cryptography from source with Rust flags:
+      Builds and installs orjson, cryptography, pydantic-core, tokenizers,
+      safetensors, and watchfiles from source with Rust flags:
         RUSTFLAGS="-C target-cpu=znver5 -C opt-level=3"
       This enables full AVX-512 + VAES codegen for Zen 5.
 
@@ -1581,8 +1604,10 @@ packages:
     steps: [32]
     depends_on: [cpython, pytorch]
     notes: |
-      Builds and installs numpy, sentencepiece, zstandard, asyncpg, duckdb from
-      source with Zen 5 optimization flags.
+      Builds and installs numpy, sentencepiece, zstandard, asyncpg, duckdb,
+      PyYAML, psutil, Pillow, uvloop, httptools, msgspec, aiohttp,
+      multidict, yarl, and frozenlist from source with Zen 5 optimization
+      flags.
 
       numpy: cmake pip wrapper breaks in build isolation; replaced with
       symlink to system cmake.
@@ -1637,8 +1662,12 @@ packages:
         build_dir: "build-lemonade"
         cmake_flags:
           GGML_HIP: "ON"
+          GGML_NATIVE: "ON"
+          GGML_OPENMP: "ON"
+          GGML_CCACHE: "ON"
           AMDGPU_TARGETS: "gfx1151"
           GGML_LTO: "ON"
+          CMAKE_INTERPROCEDURAL_OPTIMIZATION: "ON"
           LLAMA_BUILD_WEBUI: "OFF"
         hip_flags: "--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
         env:
@@ -1652,7 +1681,11 @@ packages:
         build_dir: "build-vulkan"
         cmake_flags:
           GGML_VULKAN: "ON"
+          GGML_NATIVE: "ON"
+          GGML_OPENMP: "ON"
+          GGML_CCACHE: "ON"
           GGML_LTO: "ON"
+          CMAKE_INTERPROCEDURAL_OPTIMIZATION: "ON"
           GGML_VULKAN_CHECK_RESULTS: "OFF"
           GGML_VULKAN_VALIDATE: "OFF"
           GGML_VULKAN_DEBUG: "OFF"

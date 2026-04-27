@@ -29,7 +29,7 @@
 #   scripts/build-vllm.sh --rebuild   # Force rebuild (clean + build)
 #   scripts/build-vllm.sh --step N    # Run from step N onward
 #
-# Build pipeline (38 steps):
+# Build pipeline (40 steps):
 #   Phase A: ROCm SDK (TheRock — builds amdclang used by everything downstream)
 #     1. Clone TheRock          4. Build TheRock
 #     2. Create bootstrap venv  5. Validate ROCm
@@ -61,14 +61,12 @@
 #    27. Clone Flash Attention  29b. Rebuild AITER from source (CK-aligned)
 #    28. Patch Flash Attention
 #
-#   Phase G: Validation + Warmup
+#   Phase G: Validation
 #    30. Smoke test
-#    30b. AITER JIT pre-warm (compile all buildable modules ahead of time)
-#    30c. TunableOp warmup (populate GEMM autotuning CSV)
 #
 #   Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
-#    31. Build Rust wheels      (orjson, cryptography — AVX-512 + VAES)
-#    32. Build C/C++ wheels     (numpy, sentencepiece, zstandard, asyncpg, duckdb)
+#    31. Build Rust wheels      (orjson, cryptography, tokenizers, safetensors, pydantic-core, watchfiles)
+#    32. Build C/C++ wheels     (numpy, sentencepiece, zstandard, asyncpg, duckdb, Pillow, aiohttp, etc.)
 #    33. Export source wheels    (torch, triton, torchvision, amd-aiter, amdsmi)
 #
 #   Phase I: Lemonade Inference Server (llama.cpp + FLM + ONNX)
@@ -77,8 +75,12 @@
 #    36. Install Lemonade SDK from PyPI (lemonade-sdk)
 #    37. Validate Lemonade + stable-diffusion.cpp
 #
-#   Phase J: Backend Smoke Test
+#   Phase J: Backend Smoke Test + Benchmarks
 #    38. Backend smoke test (all inference backends)
+#    39. Benchmark optimized backends
+#
+#   Phase K: Deferred JIT Warmup
+#    40. AITER JIT pre-warm (compile all remaining buildable modules ahead of time)
 
 set -euo pipefail
 
@@ -375,31 +377,250 @@ log_step() {
 # Find newest wheel matching a glob pattern. Returns empty string (not error)
 # if no match exists. Safe under set -euo pipefail (no ls|head pipeline).
 newest_wheel() {
-    local pattern="$1"
     local newest=""
-    for f in ${pattern}; do
-        [[ -f "${f}" ]] || continue
-        if [[ -z "${newest}" || "${f}" -nt "${newest}" ]]; then
-            newest="${f}"
-        fi
+    local pattern f
+    for pattern in "$@"; do
+        for f in ${pattern}; do
+            [[ -f "${f}" ]] || continue
+            if [[ -z "${newest}" || "${f}" -nt "${newest}" ]]; then
+                newest="${f}"
+            fi
+        done
     done
     echo "${newest}"
+}
+
+require_file() {
+    local path="$1"
+    local reason="${2:-}"
+    [[ -f "${path}" ]] || die "Required artifact missing: ${path}${reason:+ — ${reason}}"
+}
+
+require_dir() {
+    local path="$1"
+    local reason="${2:-}"
+    [[ -d "${path}" ]] || die "Required directory missing: ${path}${reason:+ — ${reason}}"
+}
+
+require_exe() {
+    local path="$1"
+    local reason="${2:-}"
+    [[ -x "${path}" ]] || die "Required executable missing: ${path}${reason:+ — ${reason}}"
+}
+
+require_glob() {
+    local pattern="$1"
+    local reason="${2:-}"
+    compgen -G "${pattern}" >/dev/null || die "Required artifact missing: ${pattern}${reason:+ — ${reason}}"
+}
+
+require_optimized_rocm() {
+    local root="${1:-${LOCAL_PREFIX}}"
+    require_dir "${root}" "TheRock install prefix must exist before downstream optimized builds"
+    require_exe "${root}/bin/hipcc" "TheRock HIP compiler driver is required"
+    require_exe "${root}/lib/llvm/bin/amdclang" "AMD-optimized clang is required; system clang is not allowed"
+    require_exe "${root}/lib/llvm/bin/amdclang++" "AMD-optimized clang++ is required; system clang++ is not allowed"
+    require_file "${root}/lib/llvm/lib/libomp.so" "TheRock OpenMP runtime is required; system libomp is not allowed"
+    require_glob "${root}/lib/libamdhip64.so*" "HIP runtime is required"
+    require_glob "${root}/lib/librocblas.so*" "rocBLAS is required for PyTorch/vLLM and llama.cpp ROCm"
+    require_glob "${root}/lib/librocsparse.so*" "rocSPARSE is required for PyTorch ROCm"
+    require_glob "${root}/lib/libhipsparselt.so*" "hipSPARSELt is required by PyTorch ROCm runtime"
+    require_glob "${root}/lib/libhipsolver.so*" "hipSOLVER is required for PyTorch ROCm"
+    require_glob "${root}/lib/libMIOpen.so*" "MIOpen is required for the ROCm ML stack"
+    require_glob "${root}/lib/librccl.so*" "RCCL is required for PyTorch distributed ROCm support"
+    if [[ -d "${root}/llvm/amdgcn/bitcode" ]]; then
+        require_glob "${root}/llvm/amdgcn/bitcode/*.bc" "ROCm device bitcode libraries are required"
+    elif [[ -d "${root}/amdgcn/bitcode" ]]; then
+        require_glob "${root}/amdgcn/bitcode/*.bc" "ROCm device bitcode libraries are required"
+    else
+        die "Required ROCm device bitcode directory missing under ${root}"
+    fi
+}
+
+sync_therock_component_artifacts() {
+    local dist_root="${THEROCK_SRC}/build/dist/rocm"
+    local copied=0
+
+    require_dir "${dist_root}" "TheRock dist tree must exist after ninja build"
+    mkdir -p "${LOCAL_PREFIX}"
+
+    info "Merging TheRock dist artifacts into ${LOCAL_PREFIX}..."
+    rsync -a "${dist_root}/" "${LOCAL_PREFIX}/"
+    copied=$(( copied + 1 ))
+
+    local artifact_dir
+    while IFS= read -r artifact_dir; do
+        [[ -d "${artifact_dir}" ]] || continue
+        info "Merging component artifact: ${artifact_dir#${THEROCK_SRC}/build/}"
+        rsync -a "${artifact_dir}/" "${LOCAL_PREFIX}/"
+        copied=$(( copied + 1 ))
+    done < <(
+        find "${THEROCK_SRC}/build" -mindepth 3 -maxdepth 6 -type d \( -name dist -o -name stage \) \
+            | grep -E '/(math-libs|ml-libs|comm-libs)/' \
+            | sort
+    )
+
+    success "Merged ${copied} TheRock artifact roots into ${LOCAL_PREFIX}"
+}
+
+configure_native_build_launchers() {
+    if command -v ccache >/dev/null 2>&1; then
+        export CMAKE_C_COMPILER_LAUNCHER=ccache
+        export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+        export CMAKE_HIP_COMPILER_LAUNCHER=ccache
+        info "CMake compiler launcher: ccache"
+    fi
+}
+
+validate_toolchain_contract() {
+    local cache_file="${1:-}"
+    require_optimized_rocm "${LOCAL_PREFIX}"
+
+    [[ "${ROCM_PATH:-}" == "${LOCAL_PREFIX}" ]] || die "ROCM_PATH must be ${LOCAL_PREFIX}, got ${ROCM_PATH:-unset}"
+    [[ "${CC:-}" == "${LOCAL_PREFIX}/lib/llvm/bin/amdclang" ]] || die "CC must be local amdclang, got ${CC:-unset}"
+    [[ "${CXX:-}" == "${LOCAL_PREFIX}/lib/llvm/bin/amdclang++" ]] || die "CXX must be local amdclang++, got ${CXX:-unset}"
+    [[ "${PATH}" == *"${LOCAL_PREFIX}/lib/llvm/bin"* ]] || die "PATH missing local amdclang directory"
+    [[ "${LD_LIBRARY_PATH:-}" == *"${LOCAL_PREFIX}/lib"* ]] || die "LD_LIBRARY_PATH missing local ROCm library directory"
+    [[ "${CMAKE_PREFIX_PATH:-}" == *"${LOCAL_PREFIX}"* ]] || die "CMAKE_PREFIX_PATH missing local ROCm prefix"
+    [[ "${LD_PRELOAD:-}" != *"/opt/rocm"* ]] || die "LD_PRELOAD leaks /opt/rocm: ${LD_PRELOAD}"
+
+    if [[ -n "${cache_file}" && -f "${cache_file}" ]]; then
+        if grep -E '/opt/rocm(/|$)' "${cache_file}" \
+            | grep -Ev 'CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH|CMAKE_ARGS:.*CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH' >/dev/null; then
+            grep -nE '/opt/rocm(/|$)' "${cache_file}" \
+                | grep -Ev 'CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH|CMAKE_ARGS:.*CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH' \
+                | head -40 >&2
+            die "CMake cache ${cache_file} resolved ROCm packages from /opt/rocm; local TheRock artifacts are required"
+        fi
+        if grep -E 'OpenMP_.*LIBRARY:.*=/usr/.*/libomp\.so|FIND_PACKAGE_MESSAGE_DETAILS_OpenMP.*\[/usr/.*/libomp\.so' "${cache_file}" >/dev/null; then
+            grep -nE 'OpenMP_.*LIBRARY:.*=/usr/.*/libomp\.so|FIND_PACKAGE_MESSAGE_DETAILS_OpenMP.*\[/usr/.*/libomp\.so' \
+                "${cache_file}" | head -40 >&2
+            die "CMake cache ${cache_file} resolved OpenMP from /usr; local TheRock libomp is required"
+        fi
+    fi
+
+    success "Toolchain contract valid: local TheRock ROCm + amdclang only"
+}
+
+configure_local_rocm_cmake_packages() {
+    local pkg name path
+    local openmp_lib="${LOCAL_PREFIX}/lib/llvm/lib/libomp.so"
+    local openmp_include
+    local openmp_preload="${VLLM_DIR}/force-local-openmp.cmake"
+    local -a package_dirs=(
+        "rocblas_DIR:rocblas"
+        "hipblas_DIR:hipblas"
+        "hipblaslt_DIR:hipblaslt"
+        "hipsparse_DIR:hipsparse"
+        "hipsparselt_DIR:hipsparselt"
+        "hipsolver_DIR:hipsolver"
+        "rocsparse_DIR:rocsparse"
+        "rocsolver_DIR:rocsolver"
+        "rccl_DIR:rccl"
+        "miopen_DIR:miopen"
+        "rocrand_DIR:rocrand"
+        "hiprtc_DIR:hiprtc"
+        "hip-lang_DIR:hip-lang"
+    )
+
+    for pkg in "${package_dirs[@]}"; do
+        name="${pkg%%:*}"
+        path="${LOCAL_PREFIX}/lib/cmake/${pkg#*:}"
+        require_dir "${path}" "Required local ROCm CMake package is missing: ${name}"
+        if [[ "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            export "${name}=${path}"
+        fi
+        CMAKE_ARGS="${CMAKE_ARGS:-} -D${name}=${path}"
+    done
+
+    require_file "${openmp_lib}" "Required local TheRock OpenMP runtime is missing"
+    openmp_include="$("${LOCAL_PREFIX}/lib/llvm/bin/amdclang" -print-resource-dir)/include"
+    require_file "${openmp_include}/omp.h" "Required local TheRock OpenMP headers are missing"
+    mkdir -p "${VLLM_DIR}"
+    cat > "${openmp_preload}" <<EOF
+set(OpenMP_C_FLAGS "-fopenmp=libomp" CACHE STRING "Local TheRock OpenMP C flags" FORCE)
+set(OpenMP_CXX_FLAGS "-fopenmp=libomp" CACHE STRING "Local TheRock OpenMP CXX flags" FORCE)
+set(OpenMP_C_LIB_NAMES "libomp" CACHE STRING "Local TheRock OpenMP C libraries" FORCE)
+set(OpenMP_CXX_LIB_NAMES "libomp" CACHE STRING "Local TheRock OpenMP CXX libraries" FORCE)
+set(OpenMP_libomp_LIBRARY "${openmp_lib}" CACHE FILEPATH "Local TheRock libomp" FORCE)
+set(OpenMP_omp_LIBRARY "${openmp_lib}" CACHE FILEPATH "Local TheRock libomp alias" FORCE)
+set(OpenMP_C_INCLUDE_DIR "${openmp_include}" CACHE PATH "Local TheRock OpenMP C include" FORCE)
+set(OpenMP_CXX_INCLUDE_DIR "${openmp_include}" CACHE PATH "Local TheRock OpenMP CXX include" FORCE)
+EOF
+    export OpenMP_C_FLAGS="-fopenmp=libomp"
+    export OpenMP_CXX_FLAGS="-fopenmp=libomp"
+    export OpenMP_C_LIB_NAMES="libomp"
+    export OpenMP_CXX_LIB_NAMES="libomp"
+    export OpenMP_libomp_LIBRARY="${openmp_lib}"
+    export OpenMP_omp_LIBRARY="${openmp_lib}"
+    export OpenMP_C_INCLUDE_DIR="${openmp_include}"
+    export OpenMP_CXX_INCLUDE_DIR="${openmp_include}"
+    export OMP_PREFIX="${LOCAL_PREFIX}/lib/llvm"
+    export CMAKE_PROJECT_INCLUDE_BEFORE="${openmp_preload}"
+    CMAKE_ARGS="${CMAKE_ARGS:-} -DOpenMP_C_FLAGS=-fopenmp=libomp"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_CXX_FLAGS=-fopenmp=libomp"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_C_LIB_NAMES=libomp"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_CXX_LIB_NAMES=libomp"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_libomp_LIBRARY=${openmp_lib}"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_omp_LIBRARY=${openmp_lib}"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_C_INCLUDE_DIR=${openmp_include}"
+    CMAKE_ARGS="${CMAKE_ARGS} -DOpenMP_CXX_INCLUDE_DIR=${openmp_include}"
+    CMAKE_ARGS="${CMAKE_ARGS:-} -DROCM_INCLUDE_DIRS=${LOCAL_PREFIX}/include"
+    CMAKE_ARGS="${CMAKE_ARGS} -DCMAKE_IGNORE_PREFIX_PATH=/opt/rocm"
+    CMAKE_ARGS="${CMAKE_ARGS} -DCMAKE_SYSTEM_IGNORE_PREFIX_PATH=/opt/rocm"
+    export CMAKE_IGNORE_PREFIX_PATH="/opt/rocm"
+    export CMAKE_SYSTEM_IGNORE_PREFIX_PATH="/opt/rocm"
+    export CMAKE_ARGS
+}
+
+write_build_manifest() {
+    local output_path="$1"
+    local name="$2"
+    local src_dir="$3"
+    local build_dir="$4"
+    local backend="$5"
+
+    local git_commit git_desc cc_version cxx_version
+    git_commit="$(git -C "${src_dir}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    git_desc="$(git -C "${src_dir}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+    cc_version="$("${CC}" --version 2>/dev/null | head -1 || echo unknown)"
+    cxx_version="$("${CXX}" --version 2>/dev/null | head -1 || echo unknown)"
+
+    {
+        echo "name=${name}"
+        echo "backend=${backend}"
+        echo "git_commit=${git_commit}"
+        echo "git_describe=${git_desc}"
+        echo "build_dir=${build_dir}"
+        echo "cc=${CC}"
+        echo "cxx=${CXX}"
+        echo "cc_version=${cc_version}"
+        echo "cxx_version=${cxx_version}"
+        echo "rocm_path=${ROCM_PATH:-}"
+        echo "cmake_prefix_path=${CMAKE_PREFIX_PATH:-}"
+        echo "cflags=${CFLAGS:-}"
+        echo "cxxflags=${CXXFLAGS:-}"
+        echo "ldflags=${LDFLAGS:-}"
+    } > "${output_path}"
 }
 
 # Remove older versions of a wheel, keeping only the newest.
 # Usage: prune_old_wheels "torch-*.whl"
 # The glob pattern should match all versions of one package.
 prune_old_wheels() {
-    local pattern="$1"
+    local patterns=("$@")
     local newest
-    newest="$(newest_wheel "${pattern}")"
+    local pattern f
+    newest="$(newest_wheel "${patterns[@]}")"
     [[ -z "${newest}" ]] && return 0
-    for f in ${pattern}; do
-        [[ -f "${f}" ]] || continue
-        if [[ "${f}" != "${newest}" ]]; then
-            info "Removing old wheel: $(basename "${f}")"
-            rm -f "${f}"
-        fi
+    for pattern in "${patterns[@]}"; do
+        for f in ${pattern}; do
+            [[ -f "${f}" ]] || continue
+            if [[ "${f}" != "${newest}" ]]; then
+                info "Removing old wheel: $(basename "${f}")"
+                rm -f "${f}"
+            fi
+        done
     done
 }
 
@@ -1023,7 +1244,7 @@ validate_pkg() {
         if eval "${expanded_cmd}" >/dev/null 2>&1; then
             success "  ${cmd}"
         else
-            warn "  FAILED: ${cmd}"
+            die "Validation failed for ${pkg_key}: ${cmd}"
         fi
     done
 }
@@ -1150,7 +1371,7 @@ build_aocl_utils() {
     # (doesn't understand -famd-opt) cause build failures. Setting
     # CMAKE_CXX_CLANG_TIDY to a truthy value prevents the find_program()
     # auto-detection, and /bin/true silently succeeds when cmake invokes it.
-    local aocl_cflags="-O3 -march=native -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -Wno-error=unused-command-line-argument"
+    local aocl_cflags="-O3 -march=native -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -Wno-error=unused-command-line-argument"
     info "Building AOCL-Utils with amdclang (no LTO, no clang-tidy)..."
     info "AOCL-Utils CFLAGS: ${aocl_cflags}"
     cmake -B build -GNinja . \
@@ -1209,7 +1430,7 @@ build_aocl_libm() {
     source "${AOCL_LIBM_SRC}/.venv/bin/activate"
     pip install scons 2>&1 | tail -1
 
-    scons -j"$(nproc)" \
+    scons -j"${VLLM_BUILD_JOBS:-$(nproc)}" \
         ALM_CC="${amdclang}" \
         ALM_CXX="${amdclangxx}" \
         --arch_config=avx512 \
@@ -1297,13 +1518,13 @@ build_python() {
         --with-ensurepip=upgrade \
         CC="${amdclang}" \
         CXX="${amdclangxx}" \
-        CFLAGS="-O3 -march=native -famd-opt -Wno-error=unused-command-line-argument -fPIC" \
-        CXXFLAGS="-O3 -march=native -famd-opt -Wno-error=unused-command-line-argument -fPIC" \
+        CFLAGS="-O3 -march=native -fno-semantic-interposition -famd-opt -Wno-error=unused-command-line-argument -fPIC" \
+        CXXFLAGS="-O3 -march=native -fno-semantic-interposition -famd-opt -Wno-error=unused-command-line-argument -fPIC" \
         LDFLAGS="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib"
 
     info "Building Python ${CPYTHON_VERSION} (PGO training + final build)..."
     info "This takes ~15-20 minutes due to PGO profiling pass."
-    make -j"$(nproc)"
+    make -j"${VLLM_BUILD_JOBS:-$(nproc)}"
 
     info "Installing Python to ${LOCAL_PREFIX}..."
     make install
@@ -1384,14 +1605,284 @@ create_bootstrap_venv() {
 # Step 9: Create final virtual environment (using our custom Python)
 create_final_venv() {
     local python_bin="${LOCAL_PREFIX}/bin/python3"
-    if [[ ! -x "${python_bin}" ]]; then
-        warn "Source-built Python not found, falling back to system python3 for final venv"
-        python_bin="$(command -v python3)"
-    else
-        info "Using source-built Python: ${python_bin}"
-    fi
+    require_exe "${python_bin}" "source-built Python from step 8 is required for the final optimized venv"
+    info "Using source-built Python: ${python_bin}"
 
     create_managed_venv 9 "Create final virtual environment" "${python_bin}" "${VLLM_VENV}" yes
+}
+
+patch_therock_rocr_runtime_blit() {
+    local blit_cmake="${THEROCK_SRC}/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/image/blit_src/CMakeLists.txt"
+    [[ -f "${blit_cmake}" ]] || return 0
+
+    if grep -q '_rocm_device_lib_candidates' "${blit_cmake}" && \
+       grep -q '_rocm_device_lib_flag} ${WIN_CL_COMPILE_OPTION}' "${blit_cmake}" && \
+       ! grep -q 'DEFINED AMDGPU_TARGETS' "${blit_cmake}"; then
+        return 0
+    fi
+
+    info "Patching ROCR-Runtime image blit build for TheRock device-libs..."
+    "${VLLM_VENV}/bin/python" - "${blit_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+old_targets = '''if (NOT DEFINED TARGET_DEVICES)
+  if (DEFINED AMDGPU_TARGETS)
+    set(TARGET_DEVICES ${AMDGPU_TARGETS})
+  elseif(DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(TARGET_DEVICES ${CMAKE_HIP_ARCHITECTURES})
+  else()
+    set (TARGET_DEVICES "gfx700;gfx701;gfx702;gfx801;gfx802;gfx803;gfx805;gfx810"
+                        "gfx900;gfx902;gfx904;gfx906;gfx908;gfx909;gfx90a;gfx90c;gfx942;gfx950"
+                        "gfx1010;gfx1011;gfx1012;gfx1013;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036"
+                        "gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153"
+                        "gfx1200;gfx1201")
+  endif()
+endif()'''
+new_targets = '''if (NOT DEFINED TARGET_DEVICES)
+  set (TARGET_DEVICES "gfx700;gfx701;gfx702;gfx801;gfx802;gfx803;gfx805;gfx810"
+                      "gfx900;gfx902;gfx904;gfx906;gfx908;gfx909;gfx90a;gfx90c;gfx942;gfx950"
+                      "gfx1010;gfx1011;gfx1012;gfx1013;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036"
+                      "gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153"
+                      "gfx1200;gfx1201")
+endif()'''
+if old_targets in text:
+    text = text.replace(old_targets, new_targets)
+
+old_devlibs = '''function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
+ set(_rocm_device_lib_path "")
+  foreach(_candidate ${CMAKE_PREFIX_PATH}/llvm/amdgcn/bitcode ${CMAKE_PREFIX_PATH}/amdgcn/bitcode)
+    if(EXISTS "${_candidate}")
+      set(_rocm_device_lib_path "${_candidate}")
+      break()
+    endif()
+  endforeach()
+  if(_rocm_device_lib_path)
+    set(_rocm_device_lib_flag "--rocm-device-lib-path=${_rocm_device_lib_path}")
+  endif()'''
+new_devlibs = '''function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
+  set(_rocm_device_lib_path "")
+  set(_rocm_device_lib_candidates "")
+  foreach(_prefix ${CMAKE_PREFIX_PATH})
+    list(APPEND _rocm_device_lib_candidates "${_prefix}/llvm/amdgcn/bitcode" "${_prefix}/amdgcn/bitcode")
+  endforeach()
+  get_property(_clang_location TARGET clang PROPERTY LOCATION)
+  if(_clang_location)
+    get_filename_component(_clang_bin_dir "${_clang_location}" DIRECTORY)
+    get_filename_component(_clang_llvm_prefix "${_clang_bin_dir}" DIRECTORY)
+    list(APPEND _rocm_device_lib_candidates
+      "${_clang_llvm_prefix}/amdgcn/bitcode"
+      "${_clang_llvm_prefix}/lib/clang/${LLVM_VERSION_MAJOR}/amdgcn/bitcode")
+  endif()
+  foreach(_candidate ${_rocm_device_lib_candidates})
+    if(EXISTS "${_candidate}")
+      set(_rocm_device_lib_path "${_candidate}")
+      break()
+    endif()
+  endforeach()
+  if(_rocm_device_lib_path)
+    set(_rocm_device_lib_flag "--rocm-device-lib-path=${_rocm_device_lib_path}")
+  endif()'''
+if old_devlibs in text:
+    text = text.replace(old_devlibs, new_devlibs)
+
+text = text.replace(
+    '-target amdgcn-amd-amdhsa -mcpu=${TARGET_ID} -mcode-object-version=4 ${WIN_CL_COMPILE_OPTION}',
+    '-target amdgcn-amd-amdhsa -mcpu=${TARGET_ID} -mcode-object-version=4 ${_rocm_device_lib_flag} ${WIN_CL_COMPILE_OPTION}',
+)
+
+if '_rocm_device_lib_candidates' not in text or 'DEFINED AMDGPU_TARGETS' in text or '_rocm_device_lib_flag} ${WIN_CL_COMPILE_OPTION}' not in text:
+    raise SystemExit(f"ROCR-Runtime blit patch pattern not found in {path}")
+
+path.write_text(text)
+PY
+}
+
+patch_therock_hipblaslt_matrix_transform_device_libs() {
+    local matrix_transform_cmake="${THEROCK_SRC}/rocm-libraries/projects/hipblaslt/device-library/matrix-transform/CMakeLists.txt"
+    [[ -f "${matrix_transform_cmake}" ]] || return 0
+
+    if grep -q '_hipblaslt_transform_hip_flags' "${matrix_transform_cmake}" && \
+       grep -q 'COMMAND ${CMAKE_CXX_COMPILER} ${_hipblaslt_transform_hip_flags}' "${matrix_transform_cmake}"; then
+        return 0
+    fi
+
+    info "Patching hipBLASLt matrix-transform device library for TheRock device-libs..."
+    "${VLLM_VENV}/bin/python" - "${matrix_transform_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = 'set(matrix_transform_cpp "${CMAKE_CURRENT_SOURCE_DIR}/matrix_transform.cpp")\n'
+insert = '''set(matrix_transform_cpp "${CMAKE_CURRENT_SOURCE_DIR}/matrix_transform.cpp")
+set(_hipblaslt_transform_hip_flags "")
+string(REGEX MATCH "--hip-device-lib-path=([^ ]+)" _hipblaslt_transform_device_lib_match "${CMAKE_CXX_FLAGS}")
+if(_hipblaslt_transform_device_lib_match)
+    list(APPEND _hipblaslt_transform_hip_flags "--hip-device-lib-path=${CMAKE_MATCH_1}")
+else()
+    get_filename_component(_hipblaslt_transform_clang_bin_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_hipblaslt_transform_clang_llvm_prefix "${_hipblaslt_transform_clang_bin_dir}" DIRECTORY)
+    if(EXISTS "${_hipblaslt_transform_clang_llvm_prefix}/amdgcn/bitcode")
+        list(APPEND _hipblaslt_transform_hip_flags "--hip-device-lib-path=${_hipblaslt_transform_clang_llvm_prefix}/amdgcn/bitcode")
+    endif()
+endif()
+'''
+if '_hipblaslt_transform_hip_flags' not in text:
+    if anchor not in text:
+        raise SystemExit(f"hipBLASLt matrix-transform anchor not found in {path}")
+    text = text.replace(anchor, insert, 1)
+
+old = '        COMMAND ${CMAKE_CXX_COMPILER} -x hip ${matrix_transform_cpp} --offload-arch=${arch} -c --offload-device-only -Xoffload-linker --build-id=sha1 -O3 -o ${output_library}'
+new = '        COMMAND ${CMAKE_CXX_COMPILER} ${_hipblaslt_transform_hip_flags} -x hip ${matrix_transform_cpp} --offload-arch=${arch} -c --offload-device-only -Xoffload-linker --build-id=sha1 -O3 -o ${output_library}'
+if old in text:
+    text = text.replace(old, new, 1)
+
+if '_hipblaslt_transform_hip_flags' not in text or new not in text:
+    raise SystemExit(f"hipBLASLt matrix-transform patch pattern not found in {path}")
+
+path.write_text(text)
+PY
+}
+
+patch_therock_hipblaslt_offload_bundler() {
+    local blas_cmake="${THEROCK_SRC}/math-libs/BLAS/CMakeLists.txt"
+    [[ -f "${blas_cmake}" ]] || return 0
+
+    if grep -q 'TENSILELITE_OFFLOADBUNDLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler' "${blas_cmake}"; then
+        return 0
+    fi
+
+    info "Patching hipBLASLt TensileLite to use TheRock clang-offload-bundler..."
+    "${VLLM_VENV}/bin/python" - "${blas_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = '    -DHIPBLASLT_ENABLE_MARKER=OFF\n  CMAKE_INCLUDES\n'
+insert = '''    -DHIPBLASLT_ENABLE_MARKER=OFF
+    "-DTENSILELITE_OFFLOADBUNDLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler"
+  CMAKE_INCLUDES
+'''
+
+if 'TENSILELITE_OFFLOADBUNDLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler' not in text:
+    if anchor not in text:
+        raise SystemExit(f"hipBLASLt CMake args anchor not found in {path}")
+    text = text.replace(anchor, insert, 1)
+
+if 'TENSILELITE_OFFLOADBUNDLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler' not in text:
+    raise SystemExit(f"hipBLASLt offload bundler patch incomplete in {path}")
+
+path.write_text(text)
+PY
+}
+
+patch_therock_rocwmma_disable_samples() {
+    local math_cmake="${THEROCK_SRC}/math-libs/CMakeLists.txt"
+    [[ -f "${math_cmake}" ]] || return 0
+
+    if grep -q 'ROCWMMA_BUILD_SAMPLES=OFF' "${math_cmake}"; then
+        return 0
+    fi
+
+    info "Disabling rocWMMA sample clients for TheRock runtime build..."
+    "${VLLM_VENV}/bin/python" - "${math_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = '      "-DROCWMMA_BUILD_TESTS=$<BOOL:${THEROCK_BUILD_TESTING}>"\n'
+insert = '''      "-DROCWMMA_BUILD_TESTS=$<BOOL:${THEROCK_BUILD_TESTING}>"
+      -DROCWMMA_BUILD_SAMPLES=OFF
+      -DROCWMMA_BUILD_COMMUNITY_SAMPLES=OFF
+'''
+if anchor not in text:
+    raise SystemExit(f"rocWMMA CMake args anchor not found in {path}")
+path.write_text(text.replace(anchor, insert, 1))
+	PY
+}
+
+patch_therock_miopen_tool_paths() {
+    local ml_cmake="${THEROCK_SRC}/ml-libs/CMakeLists.txt"
+    [[ -f "${ml_cmake}" ]] || return 0
+
+    if grep -q 'HIP_OC_COMPILER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/amdclang' "${ml_cmake}" && \
+       grep -q 'MIOPEN_OFFLOADBUNDLER_BIN=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler' "${ml_cmake}" && \
+       grep -q 'MIOPEN_AMDGCN_ASSEMBLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang' "${ml_cmake}"; then
+        return 0
+    fi
+
+    info "Patching MIOpen to use TheRock AMD LLVM tools instead of /opt/rocm..."
+    "${VLLM_VENV}/bin/python" - "${ml_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = '      "-DMIOPEN_INSTALL_GPU_DATABASES=\\"${THEROCK_AMDGPU_TARGETS}\\""\n'
+insert = '''      "-DMIOPEN_INSTALL_GPU_DATABASES=\\"${THEROCK_AMDGPU_TARGETS}\\""
+      "-DHIP_OC_COMPILER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/amdclang"
+      "-DMIOPEN_OFFLOADBUNDLER_BIN=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler"
+      "-DMIOPEN_AMDGCN_ASSEMBLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang"
+'''
+
+if 'MIOPEN_AMDGCN_ASSEMBLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang' not in text:
+    if anchor not in text:
+        raise SystemExit(f"MIOpen CMake args anchor not found in {path}")
+    text = text.replace(anchor, insert, 1)
+
+required = [
+    'HIP_OC_COMPILER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/amdclang',
+    'MIOPEN_OFFLOADBUNDLER_BIN=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang-offload-bundler',
+    'MIOPEN_AMDGCN_ASSEMBLER=${CMAKE_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm/bin/clang',
+]
+missing = [item for item in required if item not in text]
+if missing:
+    raise SystemExit(f"MIOpen local tool path patch incomplete in {path}: {missing}")
+
+path.write_text(text)
+PY
+}
+
+patch_therock_hip_toolchain_flags() {
+    local subproject_cmake="${THEROCK_SRC}/cmake/therock_subproject.cmake"
+    [[ -f "${subproject_cmake}" ]] || return 0
+
+    if grep -q 'CMAKE_HIP_FLAGS_INIT.*--hip-device-lib-path' "${subproject_cmake}" && \
+       grep -q 'set(CMAKE_HIP_COMPILER' "${subproject_cmake}"; then
+        return 0
+    fi
+
+    info "Patching TheRock AMD HIP toolchain generation for CMake HIP try-compiles..."
+    "${VLLM_VENV}/bin/python" - "${subproject_cmake}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '''    set(_amd_llvm_device_lib_path "${_amd_llvm_dist_dir}/lib/llvm/amdgcn/bitcode")
+    list(APPEND _compiler_toolchain_addl_depends "${_hip_stamp_dir}/stage.stamp")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \\" --hip-path=@_hip_dist_dir@\\")\\n")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \\" --hip-device-lib-path=@_amd_llvm_device_lib_path@\\")\\n")
+    if(THEROCK_VERBOSE)'''
+new = '''    set(_amd_llvm_device_lib_path "${_amd_llvm_dist_dir}/lib/llvm/amdgcn/bitcode")
+    list(APPEND _compiler_toolchain_addl_depends "${_hip_stamp_dir}/stage.stamp")
+    string(APPEND _toolchain_contents "set(CMAKE_HIP_COMPILER \\"@AMD_LLVM_CXX_COMPILER@\\")\\n")
+    string(APPEND _toolchain_contents "set(CMAKE_HIP_PLATFORM \\"amd\\")\\n")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \\" --hip-path=@_hip_dist_dir@\\")\\n")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \\" --hip-device-lib-path=@_amd_llvm_device_lib_path@\\")\\n")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_HIP_FLAGS_INIT \\" --hip-path=@_hip_dist_dir@\\")\\n")
+    string(APPEND _toolchain_contents "string(APPEND CMAKE_HIP_FLAGS_INIT \\" --hip-device-lib-path=@_amd_llvm_device_lib_path@\\")\\n")
+    if(THEROCK_VERBOSE)'''
+if old not in text:
+    raise SystemExit(f"TheRock HIP toolchain patch pattern not found in {path}")
+path.write_text(text.replace(old, new))
+PY
 }
 
 # Step 3: Configure TheRock
@@ -1408,6 +1899,16 @@ configure_therock() {
     fi
 
     info "Configuring TheRock for gfx1151..."
+    local previous_rocm_prefix_mode="${VLLM_ROCM_PREFIX_MODE-}"
+    export VLLM_ROCM_PREFIX_MODE=therock-build
+    _vllm_source_env
+
+    patch_therock_rocr_runtime_blit
+    patch_therock_hipblaslt_matrix_transform_device_libs
+    patch_therock_hipblaslt_offload_bundler
+    patch_therock_rocwmma_disable_samples
+    patch_therock_miopen_tool_paths
+    patch_therock_hip_toolchain_flags
 
     local bootstrap_python="${VLLM_VENV}/bin/python"
     if [[ ! -x "${bootstrap_python}" ]]; then
@@ -1428,6 +1929,7 @@ configure_therock() {
     # cmake hint that propagates through sub-builds.
     cmake -B build -GNinja . \
         -DTHEROCK_AMDGPU_FAMILIES=gfx1151 \
+        -DTHEROCK_TEST_AMDGPU_TARGETS=gfx1151 \
         -DCMAKE_C_COMPILER=gcc \
         -DCMAKE_CXX_COMPILER=g++ \
         -DCMAKE_INSTALL_PREFIX="${LOCAL_PREFIX}" \
@@ -1440,6 +1942,12 @@ configure_therock() {
         # Profiler disabled: rocprofiler-sdk's vendored yaml-cpp and elfio
         # have missing <cstdint> includes under modern compilers (Clang 18+,
         # GCC 15+). Profiling is not needed for vLLM inference.
+
+    if [[ -n "${previous_rocm_prefix_mode}" ]]; then
+        export VLLM_ROCM_PREFIX_MODE="${previous_rocm_prefix_mode}"
+    else
+        unset VLLM_ROCM_PREFIX_MODE
+    fi
 
     # Restore all flags from vllm-env.sh
     # shellcheck source=vllm-env.sh
@@ -1462,12 +1970,22 @@ build_therock() {
         return
     fi
 
-    info "Building TheRock with $(nproc) cores..."
+    info "Building TheRock with ${VLLM_BUILD_JOBS:-$(nproc)} cores..."
     info "This is the longest step. Expected time: 2-4 hours."
     info "Monitor progress: tail -f ${VLLM_LOG}"
 
+    local previous_rocm_prefix_mode="${VLLM_ROCM_PREFIX_MODE-}"
+    export VLLM_ROCM_PREFIX_MODE=therock-build
+    _vllm_source_env
+
     # Apply pre-build patches from YAML (Polly, elfutils -Werror, cstdint fixes)
     apply_patches therock "${THEROCK_SRC}"
+    patch_therock_rocr_runtime_blit
+    patch_therock_hipblaslt_matrix_transform_device_libs
+    patch_therock_hipblaslt_offload_bundler
+    patch_therock_rocwmma_disable_samples
+    patch_therock_miopen_tool_paths
+    patch_therock_hip_toolchain_flags
 
     # Install Tensile Python dependencies from YAML manifest
     install_pkg_deps therock
@@ -1480,11 +1998,23 @@ build_therock() {
 
     ninja -C build
 
+    # The current TheRock default target may leave hipSPARSELt configured but
+    # unstaged, while PyTorch's ROCm extension still has a runtime dependency
+    # on libhipsparselt.so. Build it explicitly so the local prefix is complete.
+    ninja -C build hipSPARSELt+stage
+
     info "Installing TheRock to ${LOCAL_PREFIX}..."
     cmake --install build --prefix "${LOCAL_PREFIX}"
+    sync_therock_component_artifacts
 
     # Apply post-install patches from YAML (MLIR objects + FileCheck copy)
     apply_patches therock "${THEROCK_SRC}"
+
+    if [[ -n "${previous_rocm_prefix_mode}" ]]; then
+        export VLLM_ROCM_PREFIX_MODE="${previous_rocm_prefix_mode}"
+    else
+        unset VLLM_ROCM_PREFIX_MODE
+    fi
 
     # Restore all flags from vllm-env.sh
     # shellcheck source=vllm-env.sh
@@ -1510,6 +2040,9 @@ validate_rocm() {
     export LD_LIBRARY_PATH="${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     export PATH="${ROCM_PATH}/lib/llvm/bin:${ROCM_PATH}/bin:${PATH}"
     configure_openmp_runtime_env "${ROCM_PATH}"
+    require_optimized_rocm "${ROCM_PATH}"
+    configure_native_build_launchers
+    validate_toolchain_contract
 
     # Create clang/clang++ symlinks to amdclang/amdclang++ so that build
     # systems looking for "clang" on PATH find the AMD-optimized variant.
@@ -1563,7 +2096,7 @@ validate_rocm() {
         bitcode_count="$(find "${bitcode_dir}" -name '*.bc' | wc -l)"
         success "Device libraries: ${bitcode_count} bitcode files"
     else
-        warn "Device bitcode directory not found"
+        die "Device bitcode directory not found"
     fi
 
     # Check key libraries
@@ -1571,7 +2104,7 @@ validate_rocm() {
         if find "${ROCM_PATH}/lib" -name "${lib}*" -print -quit 2>/dev/null | grep -q .; then
             success "${lib} found"
         else
-            warn "${lib} not found in ${ROCM_PATH}/lib"
+            die "${lib} not found in ${ROCM_PATH}/lib — TheRock output is incomplete"
         fi
     done
 }
@@ -1600,6 +2133,8 @@ build_pytorch() {
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
+    configure_native_build_launchers
+    validate_toolchain_contract
 
     info "Building PyTorch for ROCm gfx1151..."
     info "ROCM_PATH=${ROCM_PATH}"
@@ -1609,6 +2144,10 @@ build_pytorch() {
 
     # PyTorch build environment from YAML (build-step-local, not in vllm-env.sh)
     setup_build_env pytorch
+    export ROCM_PATH="${LOCAL_PREFIX}"
+    export HIP_PATH="${LOCAL_PREFIX}"
+    export CMAKE_PREFIX_PATH="${VLLM_VENV}/lib/python3.13/site-packages:${LOCAL_PREFIX}"
+    configure_local_rocm_cmake_packages
 
     # Install Python build deps from YAML manifest
     install_pkg_deps pytorch
@@ -1661,6 +2200,7 @@ HIPEOF
         --no-deps \
         --wheel-dir "${WHEELS_DIR}" \
         -v
+    validate_toolchain_contract "${PYTORCH_SRC}/build/CMakeCache.txt"
     prune_old_wheels "${WHEELS_DIR}"/torch-*.whl
 
     # Step 2: Patch .so files INSIDE the wheel. pip wheel re-invokes cmake
@@ -1964,6 +2504,67 @@ build_aotriton() {
 
     # Apply patches from YAML (remove stray rebase 'pick' line)
     apply_patches aotriton "${AOTRITON_SRC}"
+    if grep -q 'list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")' CMakeLists.txt; then
+        info "Patching AOTriton CMakeLists.txt: remove hard-coded /opt/rocm prefix"
+        sed -i 's|list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")|list(PREPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")|' CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/setup.py ]] && grep -q 'BackendInstaller.copy(\["nvidia", "amd"\])' third_party/triton/setup.py; then
+        info "Patching AOTriton vendored Triton setup.py: use AMD-only codegen backends"
+        perl -0pi -e 's|backends = \[\*BackendInstaller\.copy\(\["nvidia", "amd"\]\), \*BackendInstaller\.copy_externals\(\)\]|_triton_codegen_backends = [b.strip() for b in os.getenv("TRITON_CODEGEN_BACKENDS", "amd").split(";") if b.strip()]\nbackends = [*BackendInstaller.copy(_triton_codegen_backends), *BackendInstaller.copy_externals()]|' third_party/triton/setup.py
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && ! grep -q 'PATCHED: load LLVM before MLIR' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: load LLVM targets before MLIR"
+        sed -i '/# MLIR/i find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_LIBRARY_DIR}/cmake/llvm)\n# PATCHED: load LLVM before MLIR because MLIR exported targets reference LLVM target libraries.\n' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && \
+        grep -q 'find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_LIBRARY_DIR}/cmake/llvm)$' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: force Triton LLVM bundle lookup"
+        sed -i 's|find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_LIBRARY_DIR}/cmake/llvm)$|find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_LIBRARY_DIR}/cmake/llvm NO_DEFAULT_PATH)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && \
+        grep -q 'find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})$' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: force Triton MLIR bundle lookup"
+        sed -i 's|find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})$|find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR} NO_DEFAULT_PATH)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && grep -q 'PATCHED: keep proton out of the AOTriton vendored runtime build' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: restore required proton dialect"
+        perl -0pi -e 's|\n  # PATCHED: keep proton out of the AOTriton vendored runtime build when disabled\.\n  if \(TRITON_BUILD_PROTON\)\n    list\(APPEND TRITON_PLUGIN_NAMES "proton"\)\n    add_subdirectory\(third_party/proton/Dialect\)\n  endif\(\)|\n  # We always build proton dialect\n  list(APPEND TRITON_PLUGIN_NAMES "proton")\n  add_subdirectory(third_party/proton/Dialect)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && grep -q '^add_subdirectory(examples)$' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: skip example plugins"
+        sed -i 's|^add_subdirectory(examples)$|# PATCHED: examples/plugins are not part of the AOTriton vendored runtime build.\n# add_subdirectory(examples)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && grep -q '^add_subdirectory(test)$' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: skip tests"
+        sed -i 's|^add_subdirectory(test)$|# PATCHED: tests are not part of the AOTriton vendored runtime build.\n# add_subdirectory(test)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && grep -q '^add_subdirectory(bin)$' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: skip command-line tools"
+        sed -i 's|^add_subdirectory(bin)$|# PATCHED: command-line tools are not part of the AOTriton vendored runtime build.\n# add_subdirectory(bin)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/CMakeLists.txt ]] && grep -q 'if(TRITON_BUILD_UT)' third_party/triton/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton CMakeLists.txt: disable unit tests"
+        sed -i 's|if(TRITON_BUILD_UT)|if(FALSE)|' third_party/triton/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/third_party/nvidia/CMakeLists.txt ]] && grep -q 'if(TRITON_BUILD_UT)' third_party/triton/third_party/nvidia/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton NVIDIA CMakeLists.txt: disable unit tests"
+        sed -i 's|if(TRITON_BUILD_UT)|if(FALSE)|' third_party/triton/third_party/nvidia/CMakeLists.txt
+    fi
+    if [[ -f third_party/triton/third_party/amd/CMakeLists.txt ]] && grep -q '^add_subdirectory(test)$' third_party/triton/third_party/amd/CMakeLists.txt; then
+        info "Patching AOTriton vendored Triton AMD CMakeLists.txt: skip tests"
+        sed -i 's|^add_subdirectory(test)$|# PATCHED: tests are not part of the AOTriton vendored runtime build.\n# add_subdirectory(test)|' third_party/triton/third_party/amd/CMakeLists.txt
+    fi
+    if [[ -f build/CMakeCache.txt ]] && \
+        grep -E '/opt/rocm(/|$)' build/CMakeCache.txt \
+            | grep -Ev 'CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH|CMAKE_ARGS:.*CMAKE_(SYSTEM_)?IGNORE_PREFIX_PATH' >/dev/null; then
+        info "Removing stale AOTriton build directory with /opt/rocm cache entries"
+        rm -rf build
+    fi
+    if [[ -f build/triton_build/temp.linux-x86_64-cpython-313/triton/CMakeCache.txt ]] && \
+        grep -Eq 'TRITON_CODEGEN_BACKENDS:STRING=amd$|LLVM_DIR:PATH=/opt/src/vllm/local|unable to find library -lProtonIR|add_triton_ut|TritonTestProton|triton-opt|ProtonGPUToLLVM|MLIRDialectPlugin|nvidia/include/Dialect/NVWS|MLIR_FOUND to FALSE|LLVMNVPTXCodeGen' build/triton_build/temp.linux-x86_64-cpython-313/triton/CMakeCache.txt build/triton_build/temp.linux-x86_64-cpython-313/triton/CMakeFiles/CMakeConfigureLog.yaml 2>/dev/null; then
+        info "Removing stale AOTriton vendored Triton build cache after backend/LLVM target patch"
+        rm -rf build/triton_build
+    fi
 
     # AOTriton's cmake-based build compiles Triton kernels ahead of time
     # into .hsaco binaries for the target GPU architecture.
@@ -1975,6 +2576,15 @@ build_aotriton() {
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
         die "CFLAGS or CMAKE_CXX_FLAGS_RELEASE not set — vllm-env.sh was not sourced"
     fi
+    export ROCM_PATH="${LOCAL_PREFIX}"
+    export ROCM_HOME="${LOCAL_PREFIX}"
+    export HIP_PATH="${LOCAL_PREFIX}"
+    export CMAKE_PREFIX_PATH="${LOCAL_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+    export CMAKE_IGNORE_PREFIX_PATH="/opt/rocm"
+    export CMAKE_SYSTEM_IGNORE_PREFIX_PATH="/opt/rocm"
+    export TRITON_CODEGEN_BACKENDS="nvidia;amd"
+    export TRITON_BUILD_PROTON="OFF"
+    validate_toolchain_contract
     info "CC=${CC}"
     info "CFLAGS=${CFLAGS}"
     info "CMAKE_CXX_FLAGS_RELEASE=${CMAKE_CXX_FLAGS_RELEASE}"
@@ -1984,8 +2594,18 @@ build_aotriton() {
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER="${CC}" \
         -DCMAKE_CXX_COMPILER="${CXX}" \
+        -DCMAKE_PREFIX_PATH="${LOCAL_PREFIX};${CMAKE_PREFIX_PATH}" \
+        -DCMAKE_IGNORE_PREFIX_PATH="/opt/rocm" \
+        -DCMAKE_SYSTEM_IGNORE_PREFIX_PATH="/opt/rocm" \
+        -DROCM_INCLUDE_DIRS="${LOCAL_PREFIX}/include" \
+        -DROCM_VERSION_HEADER_PATH="${LOCAL_PREFIX}/include/rocm-core/rocm_version.h" \
         -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
         -DAOTRITON_TARGET_ARCH="gfx1151"
+    validate_toolchain_contract "${AOTRITON_SRC}/build/CMakeCache.txt"
+    if grep -RE --include='*.ninja' --include='compile_commands.json' -n -- '-isystem /opt/rocm/include|/opt/rocm/include' build >/dev/null 2>&1; then
+        grep -RE --include='*.ninja' --include='compile_commands.json' -n -- '-isystem /opt/rocm/include|/opt/rocm/include' build | head -40 >&2
+        die "AOTriton build files still reference /opt/rocm/include; local TheRock ROCm headers are required"
+    fi
 
     ninja -C build install/strip
 
@@ -3830,7 +4450,7 @@ except ImportError as e:
     info "  All compiled from source with Clang $(${CC} --version | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1)"
 }
 
-# Step 30b: Pre-warm AITER JIT modules
+# Step 40: Pre-warm AITER JIT modules
 # Compiles all buildable AITER HIP C++ modules ahead of time so that the first
 # vLLM inference request doesn't stall for minutes while modules JIT-compile.
 # In a CK-free build (no Composable Kernel sources), 56 of 72 modules are
@@ -3844,7 +4464,7 @@ except ImportError as e:
 # These failures are non-fatal — the modules target gfx9xx hardware features
 # that RDNA 3.5 doesn't have and would never be called at runtime.
 warmup_aiter_jit() {
-    log_step 30 "Pre-warm AITER JIT modules"
+    log_step 40 "Pre-warm AITER JIT modules"
 
     # Skip if AITER is not enabled
     local aiter_status
@@ -4529,6 +5149,70 @@ print('PASS')
     success "Backend smoke test complete: ${pass_count}/${#backends[@]} backends operational"
 }
 
+# Step 39: Benchmark optimized backends
+benchmark_optimized_backends() {
+    log_step 39 "Benchmark optimized backends"
+
+    local bench_dir="${VLLM_DIR}/benchmarks"
+    local bench_log="${bench_dir}/bench-$(date +%Y%m%d-%H%M%S).log"
+    mkdir -p "${bench_dir}"
+
+    validate_toolchain_contract
+
+    {
+        echo "Benchmark run: $(date -Is)"
+        echo "ROCM_PATH=${ROCM_PATH}"
+        echo "CC=${CC}"
+        echo "CXX=${CXX}"
+        echo
+    } | tee "${bench_log}"
+
+    info "Running PyTorch HIP matmul benchmark..."
+    python - <<'PY' | tee -a "${bench_log}"
+import time
+import torch
+
+assert torch.cuda.is_available(), "ROCm device is not visible to PyTorch"
+device = "cuda"
+dtype = torch.float16
+n = 4096
+a = torch.randn((n, n), device=device, dtype=dtype)
+b = torch.randn((n, n), device=device, dtype=dtype)
+for _ in range(5):
+    torch.mm(a, b)
+torch.cuda.synchronize()
+iters = 20
+start = time.perf_counter()
+for _ in range(iters):
+    torch.mm(a, b)
+torch.cuda.synchronize()
+elapsed = time.perf_counter() - start
+tflops = (2 * n * n * n * iters) / elapsed / 1e12
+print(f"pytorch_matmul_fp16_n{n}: {tflops:.2f} TFLOP/s ({elapsed/iters:.4f}s/iter)")
+PY
+
+    local gguf_repo gguf_file gguf_path=""
+    gguf_repo="$(ycfg '.smoke_test.gguf_repo')"
+    gguf_file="$(ycfg '.smoke_test.gguf_file')"
+    if [[ -n "${gguf_repo}" && -n "${gguf_file}" ]]; then
+        gguf_path="$(python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('${gguf_repo}', '${gguf_file}'))" | tail -1)"
+    fi
+    require_file "${gguf_path}" "GGUF benchmark model is required"
+
+    require_exe "${LLAMACPP_INSTALL_DIR}/llama-bench" "ROCm llama.cpp benchmark binary is required"
+    require_exe "${LLAMACPP_VULKAN_DIR}/llama-bench" "Vulkan llama.cpp benchmark binary is required"
+
+    info "Running llama.cpp ROCm benchmark..."
+    timeout -k 15 "${BENCH_LLAMA_TIMEOUT:-300}" "${LLAMACPP_INSTALL_DIR}/llama-bench" \
+        -m "${gguf_path}" -ngl 99 -p 512 -n 128 2>&1 | tee -a "${bench_log}"
+
+    info "Running llama.cpp Vulkan benchmark..."
+    timeout -k 15 "${BENCH_LLAMA_TIMEOUT:-300}" "${LLAMACPP_VULKAN_DIR}/llama-bench" \
+        -m "${gguf_path}" -ngl 99 -p 512 -n 128 2>&1 | tee -a "${bench_log}"
+
+    success "Benchmark results written to ${bench_log}"
+}
+
 # =============================================================================
 # Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
 # =============================================================================
@@ -4540,9 +5224,9 @@ print('PASS')
 #   Rust packages:  RUSTFLAGS="-C target-cpu=znver5" enables AVX-512, VAES
 #   C/C++ packages: CFLAGS from vllm-env.sh (-O3 -march=native -flto=thin ...)
 
-# Step 31: Build Rust optimized wheels (orjson, cryptography)
+# Step 31: Build Rust optimized wheels
 build_rust_wheels() {
-    log_step 31 "Build Rust optimized wheels (orjson, cryptography)"
+    log_step 31 "Build Rust optimized wheels (orjson, cryptography, pydantic-core, tokenizers, safetensors, watchfiles)"
 
     mkdir -p "${WHEELS_DIR}"
 
@@ -4582,55 +5266,43 @@ build_rust_wheels() {
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="amdclang"
     unset CFLAGS CXXFLAGS LDFLAGS
 
-    # orjson: Rust JSON library used on every AMQP packet, API response,
-    # and JSONL stream operation. AVX-512 enables SIMD JSON parsing.
-    local _orjson_wheel
-    _orjson_wheel="$(newest_wheel "${WHEELS_DIR}"/orjson-*.whl)"
-    if [[ -n "${_orjson_wheel}" ]]; then
-        info "orjson wheel already exists: $(basename "${_orjson_wheel}")"
-    else
-        info "Building orjson from source with Zen 5 optimizations..."
-        pip wheel orjson \
-            --no-binary orjson \
-            --no-cache-dir \
-            --no-deps \
-            --wheel-dir "${WHEELS_DIR}" \
-            -v
-        prune_old_wheels "${WHEELS_DIR}"/orjson-*.whl
-        _orjson_wheel="$(newest_wheel "${WHEELS_DIR}"/orjson-*.whl)"
-        if [[ -z "${_orjson_wheel}" ]]; then
-            die "orjson wheel build failed"
-        fi
-        success "orjson wheel built: $(basename "${_orjson_wheel}")"
-    fi
-    # Install into venv (replace any existing version)
-    uv pip install --force-reinstall --no-deps "${_orjson_wheel}"
+    # Format: pip-name|wheel-filename-prefix|rationale.
+    # pydantic-core, tokenizers, and safetensors are pulled by the lbox platform
+    # and the inference stack. Building them with target-cpu=znver5 keeps JSON
+    # validation, tokenization, and model/checkpoint I/O on native Rust codegen.
+    local -a _rust_packages=(
+        "orjson|orjson|Rust JSON hot path for AMQP, API responses, and JSONL streams"
+        "cryptography|cryptography|Rust/C crypto; VAES enables wider AES operations"
+        "pydantic-core|pydantic_core|Pydantic/FastAPI validation core"
+        "tokenizers|tokenizers|Hugging Face tokenizer hot path"
+        "safetensors|safetensors|Safe model/checkpoint tensor I/O"
+        "watchfiles|watchfiles|Rust filesystem watcher used by ASGI/dev service paths"
+    )
 
-    # cryptography: Rust/C library for ChaCha20-Poly1305 encryption of
-    # encrypted data payloads. VAES target feature enables 4x parallel
-    # AES operations in AVX-512 registers.
-    local _crypto_wheel
-    _crypto_wheel="$(newest_wheel "${WHEELS_DIR}"/cryptography-*.whl)"
-    if [[ -n "${_crypto_wheel}" ]]; then
-        info "cryptography wheel already exists: $(basename "${_crypto_wheel}")"
-    else
-        info "Building cryptography from source with Zen 5 optimizations..."
-        # cryptography needs OpenSSL headers for its C components
-        pip wheel cryptography \
-            --no-binary cryptography \
-            --no-cache-dir \
-            --no-deps \
-            --wheel-dir "${WHEELS_DIR}" \
-            -v
-        prune_old_wheels "${WHEELS_DIR}"/cryptography-*.whl
-        _crypto_wheel="$(newest_wheel "${WHEELS_DIR}"/cryptography-*.whl)"
-        if [[ -z "${_crypto_wheel}" ]]; then
-            die "cryptography wheel build failed"
+    local _rust_spec _pip_name _wheel_prefix _rationale _pkg_wheel
+    for _rust_spec in "${_rust_packages[@]}"; do
+        IFS='|' read -r _pip_name _wheel_prefix _rationale <<< "${_rust_spec}"
+        _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl)"
+        if [[ -n "${_pkg_wheel}" ]]; then
+            info "${_pip_name} wheel already exists: $(basename "${_pkg_wheel}")"
+        else
+            info "Building ${_pip_name} from source with Zen 5 optimizations..."
+            info "  ${_rationale}"
+            pip wheel "${_pip_name}" \
+                --no-binary "${_pip_name}" \
+                --no-cache-dir \
+                --no-deps \
+                --wheel-dir "${WHEELS_DIR}" \
+                -v
+            prune_old_wheels "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl
+            _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl)"
+            if [[ -z "${_pkg_wheel}" ]]; then
+                die "${_pip_name} wheel build failed"
+            fi
+            success "${_pip_name} wheel built: $(basename "${_pkg_wheel}")"
         fi
-        success "cryptography wheel built: $(basename "${_crypto_wheel}")"
-    fi
-    # Install into venv (replace any existing version)
-    uv pip install --force-reinstall --no-deps "${_crypto_wheel}"
+        uv pip install --force-reinstall --no-deps "${_pkg_wheel}"
+    done
 
     unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
 
@@ -4642,7 +5314,7 @@ build_rust_wheels() {
 
 # Step 32: Build C/C++ optimized wheels
 build_native_wheels() {
-    log_step 32 "Build C/C++ optimized wheels (numpy, sentencepiece, zstandard, asyncpg, duckdb)"
+    log_step 32 "Build C/C++ optimized wheels (numpy, sentencepiece, zstandard, asyncpg, duckdb, pyyaml, psutil, pillow, uvloop, httptools, msgspec, aiohttp)"
 
     mkdir -p "${WHEELS_DIR}"
 
@@ -4694,6 +5366,13 @@ build_native_wheels() {
     #   zstandard:    Zstd compression with AVX-512 VAES paths (JSONL streaming)
     #   asyncpg:      PostgreSQL wire protocol, every DB call
     #   duckdb:       Embedded OLAP engine for local analytics and parquet scans
+    #   PyYAML:       libyaml-backed manifest/config parsing
+    #   psutil:       Native process/system telemetry for schedulers and monitors
+    #   Pillow:       Image/PDF/OCR preprocessing used by corpus enrichment
+    #   uvloop:       libuv-backed asyncio event loop for FastAPI service paths
+    #   httptools:    Native HTTP parser used by uvicorn[standard]
+    #   msgspec:      Native JSON/MessagePack structs for API and queue payloads
+    #   aiohttp stack: Native HTTP client/server helpers used by async services
     # Excluded:
     #   pyzstd — now pure Python (C extension moved to backports-zstd), and
     #     redundant since zstandard covers the same use case (PyTorch checkpoint
@@ -4702,17 +5381,30 @@ build_native_wheels() {
     #     separate dependency tree). The PyPI binary uses runtime SIMD dispatch
     #     (detects AVX-512 at startup), so there's no meaningful gain from a
     #     source build. Arrow's hot paths already use the best available ISA.
+    # Format: pip-name|wheel-filename-prefix. Prefix differs for normalized
+    # project names such as PyYAML and Pillow.
     local -a _packages=(
-        "numpy"
-        "sentencepiece"
-        "zstandard"
-        "asyncpg"
-        "duckdb"
+        "numpy|numpy"
+        "sentencepiece|sentencepiece"
+        "zstandard|zstandard"
+        "asyncpg|asyncpg"
+        "duckdb|duckdb"
+        "PyYAML|pyyaml"
+        "psutil|psutil"
+        "Pillow|pillow"
+        "uvloop|uvloop"
+        "httptools|httptools"
+        "msgspec|msgspec"
+        "aiohttp|aiohttp"
+        "multidict|multidict"
+        "yarl|yarl"
+        "frozenlist|frozenlist"
     )
 
-    for _pkg in "${_packages[@]}"; do
-        local _pkg_wheel
-        _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
+    local _pkg_spec _pkg _wheel_prefix _pkg_wheel
+    for _pkg_spec in "${_packages[@]}"; do
+        IFS='|' read -r _pkg _wheel_prefix <<< "${_pkg_spec}"
+        _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl)"
         if [[ -n "${_pkg_wheel}" ]]; then
             info "${_pkg} wheel already exists: $(basename "${_pkg_wheel}")"
         else
@@ -4723,8 +5415,8 @@ build_native_wheels() {
                 --no-deps \
                 --wheel-dir "${WHEELS_DIR}" \
                 -v
-            prune_old_wheels "${WHEELS_DIR}"/"${_pkg}"-*.whl
-            _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_pkg}"-*.whl)"
+            prune_old_wheels "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl
+            _pkg_wheel="$(newest_wheel "${WHEELS_DIR}"/"${_wheel_prefix}"-*.whl)"
             if [[ -z "${_pkg_wheel}" ]]; then
                 die "${_pkg} wheel not found after build"
             fi
@@ -4852,7 +5544,7 @@ export_source_wheels() {
     [[ -n "${_fa_wheel}" ]] || die "flash_attn wheel missing from ${WHEELS_DIR} — run step 29 first"
     success "flash_attn wheel exists: $(basename "${_fa_wheel}")"
 
-    # Summary — verify all 14 packages are present
+    # Summary — verify all expected packages are present
     local _wheel_count
     _wheel_count="$(compgen -G "${WHEELS_DIR}/*.whl" | wc -l)"
     echo ""
@@ -4861,8 +5553,8 @@ export_source_wheels() {
         [[ -f "${_whl}" ]] || continue
         info "  $(basename "${_whl}")"
     done
-    if [[ "${_wheel_count}" -lt 14 ]]; then
-        die "Expected at least 14 wheels, found ${_wheel_count}. Check build log for failures."
+    if [[ "${_wheel_count}" -lt 28 ]]; then
+        die "Expected at least 28 wheels, found ${_wheel_count}. Check build log for failures."
     fi
 
     success "Source wheel export complete — all ${_wheel_count} wheels verified"
@@ -4879,6 +5571,8 @@ export_source_wheels() {
 
 clone_and_build_lemonade() {
     log_step 34 "Clone Lemonade + build llama.cpp with hipBLAS for gfx1151"
+    configure_native_build_launchers
+    validate_toolchain_contract
 
     # Clone both repos using generic clone_pkg (reads flags from YAML)
     clone_pkg lemonade "${LEMONADE_SRC}" "Lemonade SDK"
@@ -4897,38 +5591,48 @@ clone_and_build_lemonade() {
         local _cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
 
         if [[ ! -x "${_cc}" ]]; then
-            warn "TheRock amdclang not found at ${_cc}, falling back to system clang"
-            _cc="clang"
-            _cxx="clang++"
+            die "TheRock amdclang not found at ${_cc}; refusing to build llama.cpp ROCm with non-optimized system clang"
         fi
 
         # CPU optimization flags (Zen 5 + Polly + AMD-specific)
-        local _cpu_flags="-O3 -march=native -flto=thin -mprefer-vector-width=512 -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -Wno-error=unused-command-line-argument"
+        local _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
 
         # GPU optimization flags (RDNA 3.5 gfx1151)
         local _hip_flags="--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
+        local _link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
 
         cmake -B "${_build_dir}" -S "${LLAMACPP_SRC}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HIP=ON \
+            -DGGML_NATIVE=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=ON \
             -DAMDGPU_TARGETS="gfx1151" \
             -DGGML_LTO=ON \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DCMAKE_C_COMPILER="${_cc}" \
             -DCMAKE_CXX_COMPILER="${_cxx}" \
             -DCMAKE_HIP_COMPILER="${_cxx}" \
+            -DCMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-}" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-}" \
+            -DCMAKE_HIP_COMPILER_LAUNCHER="${CMAKE_HIP_COMPILER_LAUNCHER:-}" \
+            -DCMAKE_C_FLAGS="${_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS="${_cpu_flags}" \
             -DCMAKE_C_FLAGS_RELEASE="${_cpu_flags}" \
             -DCMAKE_CXX_FLAGS_RELEASE="${_cpu_flags}" \
             -DCMAKE_HIP_FLAGS="${_hip_flags}" \
-            -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-flto=thin -fuse-ld=lld" \
+            -DCMAKE_HIP_FLAGS_RELEASE="${_hip_flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${_link_flags}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${_link_flags}" \
+            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${LLAMACPP_INSTALL_DIR}" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_WEBUI=OFF \
             -DCMAKE_INSTALL_PREFIX="${LLAMACPP_INSTALL_DIR}"
 
-        cmake --build "${_build_dir}" --config Release -j "$(nproc)"
+        cmake --build "${_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
         success "llama.cpp build complete"
     fi
 
@@ -4961,9 +5665,9 @@ clone_and_build_lemonade() {
     if command -v patchelf >/dev/null 2>&1; then
         for _bin in "${_binaries[@]}"; do
             [[ -x "${LLAMACPP_INSTALL_DIR}/${_bin}" ]] || continue
-            patchelf --set-rpath "${LLAMACPP_INSTALL_DIR}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
+            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${LLAMACPP_INSTALL_DIR}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
         done
-        info "RPATH fixed for ROCm binaries -> ${LLAMACPP_INSTALL_DIR}"
+        info "RPATH fixed for ROCm binaries -> ${LOCAL_PREFIX}/lib:${LLAMACPP_INSTALL_DIR}"
     fi
 
     # Copy convert_hf_to_gguf.py for GGUF conversion pipeline
@@ -4977,6 +5681,7 @@ clone_and_build_lemonade() {
     _llama_version="$(cd "${LLAMACPP_SRC}" && git describe --tags --always 2>/dev/null || echo "master")"
     echo "${_llama_version}" > "${LLAMACPP_INSTALL_DIR}/version.txt"
     echo "rocm" > "${LLAMACPP_INSTALL_DIR}/backend.txt"
+    write_build_manifest "${LLAMACPP_INSTALL_DIR}/build-info.env" "llama.cpp" "${LLAMACPP_SRC}" "${_build_dir}" "rocm"
     info "Version tracking: ${_llama_version} (rocm backend)"
 
     # --- Write .env with gfx1151 runtime optimizations ---
@@ -5008,13 +5713,9 @@ clone_and_build_lemonade() {
 
         local _vulkan_cpu_flags
         if [[ ! -x "${_vulkan_cc}" ]]; then
-            warn "TheRock amdclang not found at ${_vulkan_cc}, falling back to system clang"
-            _vulkan_cc="clang"
-            _vulkan_cxx="clang++"
-            _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -Wno-error=unused-command-line-argument"
-        else
-            _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+            die "TheRock amdclang not found at ${_vulkan_cc}; refusing to build llama.cpp Vulkan with non-optimized system clang"
         fi
+        _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
 
         local _vulkan_link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
 
@@ -5022,22 +5723,31 @@ clone_and_build_lemonade() {
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=ON \
             -DGGML_LTO=ON \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DGGML_VULKAN_CHECK_RESULTS=OFF \
             -DGGML_VULKAN_VALIDATE=OFF \
             -DGGML_VULKAN_DEBUG=OFF \
             -DCMAKE_C_COMPILER="${_vulkan_cc}" \
             -DCMAKE_CXX_COMPILER="${_vulkan_cxx}" \
+            -DCMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-}" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-}" \
             -DCMAKE_C_FLAGS="${_vulkan_cpu_flags}" \
             -DCMAKE_CXX_FLAGS="${_vulkan_cpu_flags}" \
+            -DCMAKE_C_FLAGS_RELEASE="${_vulkan_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${_vulkan_cpu_flags}" \
             -DCMAKE_EXE_LINKER_FLAGS="${_vulkan_link_flags}" \
             -DCMAKE_SHARED_LINKER_FLAGS="${_vulkan_link_flags}" \
+            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${LLAMACPP_VULKAN_DIR}" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_WEBUI=OFF
 
-        cmake --build "${_vulkan_build_dir}" --config Release -j "$(nproc)"
+        cmake --build "${_vulkan_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
         success "llama.cpp Vulkan build complete"
     fi
 
@@ -5074,6 +5784,7 @@ clone_and_build_lemonade() {
     # Version tracking for Vulkan backend
     echo "${_llama_version}" > "${LLAMACPP_VULKAN_DIR}/version.txt"
     echo "vulkan" > "${LLAMACPP_VULKAN_DIR}/backend.txt"
+    write_build_manifest "${LLAMACPP_VULKAN_DIR}/build-info.env" "llama.cpp" "${LLAMACPP_SRC}" "${_vulkan_build_dir}" "vulkan"
 
     # Vulkan .env — no HSA/ROCm vars needed, just batch/KV optimizations
     # Q8 KV cache omitted (see ROCm .env comment above)
@@ -5087,6 +5798,8 @@ clone_and_build_lemonade() {
 
 clone_and_build_stable_diffusion() {
     log_step 35 "Clone and build stable-diffusion.cpp with Vulkan"
+    configure_native_build_launchers
+    validate_toolchain_contract
 
     clone_pkg stable_diffusion_cpp "${STABLE_DIFFUSION_SRC}" "stable-diffusion.cpp"
 
@@ -5102,13 +5815,9 @@ clone_and_build_stable_diffusion() {
 
         local _cpu_flags
         if [[ ! -x "${_cc}" ]]; then
-            warn "TheRock amdclang not found at ${_cc}, falling back to system clang"
-            _cc="clang"
-            _cxx="clang++"
-            _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -Wno-error=unused-command-line-argument"
-        else
-            _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+            die "TheRock amdclang not found at ${_cc}; refusing to build stable-diffusion.cpp Vulkan with non-optimized system clang"
         fi
+        _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
 
         local _link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
 
@@ -5117,6 +5826,8 @@ clone_and_build_stable_diffusion() {
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="${_cc}" \
             -DCMAKE_CXX_COMPILER="${_cxx}" \
+            -DCMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-}" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-}" \
             -DCMAKE_C_FLAGS="${_cpu_flags}" \
             -DCMAKE_CXX_FLAGS="${_cpu_flags}" \
             -DCMAKE_EXE_LINKER_FLAGS="${_link_flags}" \
@@ -5134,7 +5845,7 @@ clone_and_build_stable_diffusion() {
             -DGGML_VULKAN_VALIDATE=OFF \
             -DGGML_VULKAN_DEBUG=OFF
 
-        cmake --build "${_build_dir}" --config Release -j "$(nproc)"
+        cmake --build "${_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
         success "stable-diffusion.cpp Vulkan build complete"
     fi
 
@@ -5163,6 +5874,7 @@ clone_and_build_stable_diffusion() {
     _sd_version="$(cd "${STABLE_DIFFUSION_SRC}" && git describe --tags --always 2>/dev/null || echo "master")"
     echo "${_sd_version}" > "${STABLE_DIFFUSION_VULKAN_DIR}/version.txt"
     echo "vulkan" > "${STABLE_DIFFUSION_VULKAN_DIR}/backend.txt"
+    write_build_manifest "${STABLE_DIFFUSION_VULKAN_DIR}/build-info.env" "stable-diffusion.cpp" "${STABLE_DIFFUSION_SRC}" "${_build_dir}" "vulkan"
 
     success "stable-diffusion.cpp Vulkan installed at ${STABLE_DIFFUSION_VULKAN_DIR}"
 }
@@ -5377,6 +6089,12 @@ handle_rebuild() {
             rm -r "${LOCAL_PREFIX}"
             info "Removed ${LOCAL_PREFIX}"
         fi
+
+        # Rebuild cleanup removes the venv and source-built ROCm/LLVM prefix
+        # after vllm-env.sh has already been sourced. Refresh the environment so
+        # early bootstrap steps use system tools and do not retain stale PATH or
+        # LD_PRELOAD entries pointing at deleted files.
+        _vllm_source_env
 
         success "Clean complete. Starting fresh build."
     fi
