@@ -1788,6 +1788,21 @@ packages:
     binaries:
       - sd-cli
       - sd-server
+    patches:
+      # Fix SDXL CLIP-G prefix mapping in convert_tensor_name. Without this
+      # patch, init_from_diffusers_file's "te.1." prefix gets rewritten to
+      # "cond_stage_model.transformer.1." instead of the expected
+      # "cond_stage_model.1.transformer." that the SDXL CLIP-G runner
+      # registers. The downstream version detector then misclassifies the
+      # checkpoint as SD 1.x and rejects every CLIP-G tensor as unknown.
+      - type: git_apply
+        patch: "patches/sdcpp-sdxl-clipg-prefix.patch"
+        file: "src/name_conversion.cpp"
+        marker: 'te.1.", "cond_stage_model.1.transformer.'
+        description: >
+          Fix SDXL CLIP-G prefix mapping in convert_tensor_name (te.1. ->
+          cond_stage_model.1.transformer., applied before the broader te.
+          rule via deterministic vector<pair> ordering).
     notes: |
       stable-diffusion.cpp built from upstream master with recursive ggml and
       media submodules. The gfx1151 path uses the Vulkan backend because it is

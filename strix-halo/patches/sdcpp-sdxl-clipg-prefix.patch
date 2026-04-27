@@ -1,0 +1,85 @@
+# stable-diffusion.cpp: SDXL CLIP-G prefix mapping fix
+#
+# Bug: When loading an SDXL diffusers checkpoint, sd-cpp's
+# `init_from_diffusers_file` prefixes the second text encoder
+# (CLIP-G, dim 1280) tensors with `te.1.`. The downstream
+# `convert_tensor_name` rewriter holds a `prefix_map` keyed on
+# `unordered_map`, which has non-deterministic iteration order
+# AND lacks any rule for the literal `te.1.` prefix. The closest
+# existing rule, `te.` -> `cond_stage_model.transformer.`, wins
+# the substring race and rewrites
+#     te.1.text_model.X
+# to
+#     cond_stage_model.transformer.1.text_model.X
+# (the `.1.` ends up after `transformer.`, which is the wrong
+# place). The SDXL CLIP-G runner in `conditioner.hpp:135`
+# registers tensors at prefix `cond_stage_model.1.transformer.X`
+# and never finds them; the load-side version detector then
+# fails to spot any of `cond_stage_model.1` / `te.1` /
+# `conditioner.embedders.1` substring markers in the rewritten
+# names and falls through to `Version: SD 1.x`. The runtime then
+# rejects every CLIP-G tensor as `unknown tensor` and aborts
+# with `load tensors from model loader failed`.
+#
+# Fix: switch `prefix_map` from `unordered_map` to
+# `vector<pair>` so iteration order is deterministic, and insert
+# explicit rules for `te.1.` -> `cond_stage_model.1.transformer.`
+# and `te.0.` -> `cond_stage_model.transformer.` BEFORE the
+# broader `te.` rule. The vector overload of
+# `replace_with_prefix_map` already exists in this file.
+#
+# Verified on 2026-04-27 against upstream master b8bdffc on
+# AMD Strix Halo gfx1151 / Vulkan backend. Both the diffusers
+# direct-load path AND the `-M convert --convert-name` ->
+# `-M img_gen` two-step path produce a clean SDXL load with
+# `Version: SDXL` reported and no unknown-tensor warnings.
+#
+# Upstream PR: TODO (file against leejet/stable-diffusion.cpp).
+diff --git a/src/name_conversion.cpp b/src/name_conversion.cpp
+--- a/src/name_conversion.cpp
++++ b/src/name_conversion.cpp
+@@ -1069,18 +1069,27 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+         }
+     }
+
+-    std::unordered_map<std::string, std::string> prefix_map = {
++    // Use std::vector<pair> (not unordered_map) so the more-specific prefixes
++    // are tried before the broader ones. The "te.1." -> "cond_stage_model.1.transformer."
++    // rule MUST be matched before the broader "te." -> "cond_stage_model.transformer."
++    // rule, otherwise an SDXL CLIP-G tensor named "te.1.text_model.X" gets rewritten
++    // to "cond_stage_model.transformer.1.text_model.X" (broken), instead of the
++    // expected "cond_stage_model.1.transformer.text_model.X" that the SDXL CLIP-G
++    // runner registers.
++    std::vector<std::pair<std::string, std::string>> prefix_map = {
+         {"diffusion_model.", "model.diffusion_model."},
+         {"unet.", "model.diffusion_model."},
+         {"transformer.", "model.diffusion_model."},  // dit
+         {"vae.", "first_stage_model."},
+-        {"text_encoder.", "cond_stage_model.transformer."},
+-        {"te.", "cond_stage_model.transformer."},
+         {"text_encoder.2.", "cond_stage_model.1.transformer."},
++        {"text_encoder.", "cond_stage_model.transformer."},
++        {"te.1.", "cond_stage_model.1.transformer."},
++        {"te.0.", "cond_stage_model.transformer."},
++        {"te.", "cond_stage_model.transformer."},
+         {"conditioner.embedders.0.open_clip.", "cond_stage_model."},
+         // https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0
+-        {"conditioner.embedders.0.", "cond_stage_model."},
+         {"conditioner.embedders.1.", "cond_stage_model.1."},
++        {"conditioner.embedders.0.", "cond_stage_model."},
+         // {"te2.text_model.encoder.layers.", "cond_stage_model.1.model.transformer.resblocks."},
+         {"te2.", "cond_stage_model.1.transformer."},
+         {"te1.", "cond_stage_model.transformer."},
+@@ -1088,7 +1097,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+     };
+
+     if (sd_version_is_flux(version)) {
+-        prefix_map["te1."] = "text_encoders.clip_l.transformer.";
++        for (auto& entry : prefix_map) {
++            if (entry.first == "te1.") {
++                entry.second = "text_encoders.clip_l.transformer.";
++            }
++        }
+     }
+
+     replace_with_prefix_map(name, prefix_map);

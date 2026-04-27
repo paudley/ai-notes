@@ -1141,6 +1141,36 @@ apply_patches() {
                 # Build functions handle these directly; this entry exists for documentation.
                 ;;
 
+            git_apply)
+                # Apply a unified-diff patch file via `git apply`. The patch
+                # path is resolved relative to the build-vllm.sh script directory
+                # (i.e. ai-notes/strix-halo/) so patches live alongside the
+                # build script in version control. Idempotent: skipped when the
+                # marker substring is already present in the target file.
+                local p_patch p_file p_marker
+                p_patch="$(ycfg ".packages.${pkg_key}.patches[${i}].patch")"
+                p_file="$(ycfg ".packages.${pkg_key}.patches[${i}].file")"
+                p_marker="$(ycfg ".packages.${pkg_key}.patches[${i}].marker")"
+
+                local patch_path="${_SCRIPT_DIR}/${p_patch}"
+                local target_file="${src_dir}/${p_file}"
+
+                if [[ ! -f "${patch_path}" ]]; then
+                    warn "  [${i}] Patch file not found: ${patch_path}"
+                    continue
+                fi
+                if [[ ! -f "${target_file}" ]]; then
+                    info "  [${i}] ${p_file}: not found, skipping"
+                    continue
+                fi
+                if grep -q "${p_marker}" "${target_file}" 2>/dev/null; then
+                    info "  [${i}] ${p_patch}: already applied"
+                else
+                    info "  [${i}] ${p_description}"
+                    ( cd "${src_dir}" && git apply "${patch_path}" )
+                fi
+                ;;
+
             *)
                 warn "  [${i}] Unknown patch type: ${p_type}"
                 ;;
