@@ -32,9 +32,9 @@ RDNA 3.5 firmware and drm driver changes.
 |-----------|---------|
 | **Distro** | CachyOS (Arch-based, rolling) |
 | **Kernel** | 7.0.0-rc3-2-cachyos-rc (`linux-cachyos-rc`) |
-| **Compiler** | Clang/LLVM 21+ (system), then amdclang from TheRock |
-| **Python** | Built from source (3.13.x, PGO + LTO + amdclang) |
-| **ROCm** | Built from source (TheRock nightly) |
+| **Compiler** | TheRock amdclang/amdclang++ for optimized downstream builds |
+| **Python** | Built from source (3.13.12, PGO + ThinLTO + amdclang) |
+| **ROCm** | Built from source (TheRock nightly, observed 7.13 headers/runtime) |
 
 Ubuntu and Fedora are also supported — the build script detects the distro
 and provides the correct package install commands. Any distribution should
@@ -74,7 +74,7 @@ that force PIECEWISE graph mode with AITER disabled.
    flag (proprietary Zen microarchitecture tuning not available in
    upstream LLVM).
 
-## Build Pipeline (37 Steps, 10 Phases)
+## Build Pipeline (40 Steps, 11 Phases)
 
 ```
 Phase A: ROCm SDK (TheRock)
@@ -108,14 +108,12 @@ Phase F: Attention (Flash Attention + AITER)
  27. Clone Flash Attention  29b. Rebuild AITER from source (CK-aligned)
  28. Patch Flash Attention
 
-Phase G: Validation + Warmup
+Phase G: Validation
  30. Smoke test
- 30b. AITER JIT pre-warm   (compile all buildable modules ahead of time)
- 30c. TunableOp warmup     (populate GEMM autotuning CSV)
 
 Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
- 31. Build Rust wheels     (orjson, cryptography — AVX-512 + VAES)
- 32. Build C/C++ wheels    (numpy, sentencepiece, zstandard, asyncpg)
+ 31. Build Rust wheels     (orjson, cryptography, pydantic-core, tokenizers, safetensors, watchfiles)
+ 32. Build C/C++ wheels    (numpy, sentencepiece, zstandard, asyncpg, duckdb, msgspec, aiohttp, etc.)
  33. Export source wheels   (torch, triton, torchvision, amd-aiter, amdsmi)
 
 Phase I: Lemonade Inference Server
@@ -124,9 +122,33 @@ Phase I: Lemonade Inference Server
   36. Install Lemonade SDK from PyPI
   37. Validate Lemonade + stable-diffusion.cpp
 
-Phase J: Backend Smoke Test
-  38. Validate all inference backends with SmolLM2
+Phase J: Backend Smoke Test + Benchmarks
+  38. Backend smoke test
+  39. Benchmark optimized backends
+
+Phase K: Deferred JIT Warmup
+  40. AITER JIT pre-warm   (compile all remaining buildable modules ahead of time)
 ```
+
+Downstream optimized phases enforce the local TheRock toolchain contract:
+`amdclang`/`amdclang++`, source-built CPython, local ROCm math/runtime libraries,
+local hipBLASLt/hipSPARSELt/MIOpen/RCCL, and local TheRock `libomp`. The build
+fails immediately if required artifacts are missing, if `/opt/rocm` leaks into
+ROCm package resolution, or if CMake falls back to system OpenMP.
+
+Current smoke coverage verifies the installed stack before the downstream
+wheel/export phases continue: CPython 3.13.12 from `/opt/src/vllm/local`,
+PyTorch `2.12.0a0`, upstream vLLM `0.19.2rc1` dev, Triton import, flash
+attention import, AOTriton under `/opt/src/vllm/local`, AOCL-LibM under
+`/opt/src/vllm/local`, local ROCm package resolution, and AITER enabled on
+gfx1151.
+
+The AITER JIT pre-warm step is deferred to the end because it is useful for
+first-inference latency but should not block the optimized wheel, llama.cpp,
+backend smoke, or benchmark phases. It compiles every remaining buildable
+gfx1151 module into the venv. CDNA-only modules are skipped intentionally;
+attention, paged-attention, metadata, MLA, all-reduce, GEMM, and ASM module
+families are compiled where supported by the RDNA 3.5 target.
 
 ### Lemonade: Dual-Backend llama.cpp
 
@@ -176,7 +198,7 @@ The build now creates a **bootstrap virtual environment** from `python3` before
 TheRock configuration/build begins, so every early `uv pip install` happens
 inside a managed env instead of leaking packages into the system interpreter.
 After step 8 compiles the optimized CPython, step 9 recreates the canonical
-vLLM environment on `/opt/src/vllm/python/bin/python3`.
+vLLM environment on `/opt/src/vllm/local/bin/python3`.
 
 ## Quick Start
 
@@ -263,7 +285,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 
 | File | Description |
 |------|-------------|
-| `build-vllm.sh` | Master build script (38-step pipeline) |
+| `build-vllm.sh` | Master build script (40-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
 | `vllm-packages.yaml` | Package manifest (repos, branches, patches, per-distro prerequisites, bootstrap config) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
@@ -301,7 +323,7 @@ upstream (the ROCm fork is deprecated).
 
 ## Output
 
-When complete, the build produces 13 optimized wheel packages:
+When complete, the build produces at least 28 optimized wheel packages:
 
 | Wheel | Size | Type |
 |-------|------|------|
@@ -311,11 +333,26 @@ When complete, the build produces 13 optimized wheel packages:
 | amd-aiter | 43M | C++/HIP |
 | numpy | 7.1M | C (meson) |
 | cryptography | 2.4M | Rust |
+| tokenizers | varies | Rust |
+| pydantic-core | varies | Rust |
+| safetensors | varies | Rust |
 | sentencepiece | 1.5M | C++ (cmake) |
 | amdsmi | 1.4M | Pure Python |
 | torchvision | 1.3M | C++ |
+| duckdb | varies | C++ |
 | zstandard | 940K | C |
 | asyncpg | 828K | Cython |
+| uvloop | varies | Cython/C |
+| httptools | varies | C/Cython |
+| msgspec | varies | C |
+| aiohttp | varies | Cython/C |
+| multidict | varies | C |
+| yarl | varies | C |
+| frozenlist | varies | C |
+| watchfiles | varies | Rust |
+| Pillow | varies | C |
+| PyYAML | varies | C |
+| psutil | varies | C |
 | orjson | 344K | Rust |
 | flash_attn | 204K | Pure Python |
 
@@ -326,9 +363,9 @@ Python 3.13 venv.
 
 The build produces two key artifacts:
 
-1. **Optimized CPython 3.13** at `/opt/src/vllm/python/bin/python3`
+1. **Optimized CPython 3.13** at `/opt/src/vllm/local/bin/python3`
    (PGO + ThinLTO + amdclang `-famd-opt`, Zen 5 native)
-2. **13 optimized wheel packages** in `/opt/src/vllm/wheels/`
+2. **28+ optimized wheel packages** in `/opt/src/vllm/wheels/`
 
 Both are portable to any environment on the same machine (or any machine
 with the same architecture and ROCm libraries at `/opt/src/vllm/local/lib`).
@@ -348,7 +385,7 @@ Python interpreter alone provides ~5-15% speedup on compute-bound code.
 ```bash
 # 1. Create a new project with the source-built Python
 mkdir my-project && cd my-project
-uv venv --python /opt/src/vllm/python/bin/python3 .venv
+uv venv --python /opt/src/vllm/local/bin/python3 .venv
 source .venv/bin/activate
 
 # 2. Install all optimized wheels
@@ -391,9 +428,24 @@ override-dependencies = [
     "numpy==2.4.3",
     "cryptography==46.0.5",
     "orjson==3.11.7",
+    "pydantic-core==2.46.3",
+    "tokenizers==0.22.2",
+    "safetensors==0.7.0",
+    "watchfiles==1.1.1",
     "sentencepiece==0.2.1",
     "zstandard==0.25.0",
     "asyncpg==0.31.0",
+    "duckdb==1.5.2",
+    "PyYAML==6.0.3",
+    "psutil==7.2.2",
+    "Pillow==12.0.0",
+    "uvloop==0.22.1",
+    "httptools==0.7.1",
+    "msgspec==0.20.0",
+    "aiohttp==3.13.2",
+    "multidict==6.7.0",
+    "yarl==1.22.0",
+    "frozenlist==1.8.0",
 ]
 ```
 
@@ -401,7 +453,7 @@ Then create the venv with the optimized Python:
 
 ```bash
 # Point uv at the source-built Python
-uv venv --python /opt/src/vllm/python/bin/python3
+uv venv --python /opt/src/vllm/local/bin/python3
 uv sync
 ```
 

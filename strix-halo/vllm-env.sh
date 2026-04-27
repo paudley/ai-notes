@@ -34,6 +34,49 @@ export VLLM_VENV="${VLLM_DIR}/.venv"
 export VLLM_SRC="${VLLM_DIR}/vllm"
 export VLLM_LOG="${VLLM_DIR}/build.log"
 
+_VLLM_BUILD_JOBS="${VLLM_BUILD_JOBS:-$(nproc)}"
+export VLLM_BUILD_JOBS="${_VLLM_BUILD_JOBS}"
+export MAX_JOBS="${MAX_JOBS:-${_VLLM_BUILD_JOBS}}"
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${_VLLM_BUILD_JOBS}}"
+export MAKEFLAGS="${MAKEFLAGS:--j${_VLLM_BUILD_JOBS}}"
+export NINJA_STATUS="${NINJA_STATUS:-[%f/%t %e] }"
+
+_vllm_prune_colon_path() {
+    local _var_name="$1"
+    local _value="${!_var_name:-}"
+    local _entry _new_value=""
+    [[ -n "${_value}" ]] || return 0
+
+    local IFS=:
+    for _entry in ${_value}; do
+        [[ -n "${_entry}" ]] || continue
+        [[ -e "${_entry}" ]] || continue
+        case ":${_new_value}:" in
+            *:"${_entry}":*) ;;
+            *) _new_value="${_new_value:+${_new_value}:}${_entry}" ;;
+        esac
+    done
+
+    if [[ -n "${_new_value}" ]]; then
+        export "${_var_name}=${_new_value}"
+    else
+        unset "${_var_name}"
+    fi
+}
+
+_vllm_path_remove() {
+    local _remove="$1"
+    local _entry _new_path=""
+    local IFS=:
+    for _entry in ${PATH:-}; do
+        [[ "${_entry}" == "${_remove}" ]] && continue
+        _new_path="${_new_path:+${_new_path}:}${_entry}"
+    done
+    export PATH="${_new_path}"
+}
+
+_vllm_prune_colon_path LD_PRELOAD
+
 # =============================================================================
 # Unified Install Prefix
 # =============================================================================
@@ -41,6 +84,8 @@ export VLLM_LOG="${VLLM_DIR}/build.log"
 # install to a single prefix mirroring /usr/local/ layout.
 
 _LOCAL_PREFIX="${VLLM_DIR}/local"
+_THEROCK_DIST_PREFIX="${VLLM_DIR}/therock/build/dist/rocm"
+_VLLM_ROCM_PREFIX_MODE="${VLLM_ROCM_PREFIX_MODE:-auto}"
 
 # AOCL-LibM provides Zen 5 optimized transcendental functions (exp, log, sin, etc.)
 # that replace glibc libm. Built with AVX-512 paths for native 512-bit execution.
@@ -56,10 +101,14 @@ fi
 # (AMD proprietary Zen optimizations). Falls back to system clang if TheRock
 # hasn't been built yet.
 
-_THEROCK_CLANG="${_LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+if [[ "${_VLLM_ROCM_PREFIX_MODE}" == "therock-build" ]]; then
+    _THEROCK_CLANG="${_THEROCK_DIST_PREFIX}/lib/llvm/bin/amdclang"
+else
+    _THEROCK_CLANG="${_LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+fi
 if [[ -x "${_THEROCK_CLANG}" ]]; then
     export CC="${_THEROCK_CLANG}"
-    export CXX="${_LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
+    export CXX="${_THEROCK_CLANG}++"
     _AMD_OPT="-famd-opt"
 else
     export CC=clang
@@ -129,10 +178,12 @@ fi
 #   -mllvm -inline-threshold=600: Aggressive inlining for Zen 5's wide issue pipeline
 #   -mllvm -unroll-threshold=150: Aggressive unrolling for Zen 5's large reorder buffer
 #   -mllvm -adce-remove-loops: Clean up dead loop structures in AI/scientific code
+#   -fno-semantic-interposition: Allow stronger optimization across symbols inside
+#                             shared objects and Python extension modules.
 #   -Wno-error=unused-command-line-argument: Prevent -famd-opt and -mllvm flags from
 #                             becoming fatal errors when passed through to link steps
 #                             or translation units where they don't apply (e.g. googletest)
-_BASE_CFLAGS="-O3 -DNDEBUG -march=native -flto=thin -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw ${_AMD_OPT} ${_POLLY_FLAGS} -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+_BASE_CFLAGS="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw ${_AMD_OPT} ${_POLLY_FLAGS} -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
 _BASE_LDFLAGS="-flto=thin -fuse-ld=lld -Wl,-rpath,${_LOCAL_PREFIX}/lib ${_AOCL_LDFLAGS}"
 
 # Autotools / setup.py: read CFLAGS, CXXFLAGS, LDFLAGS from environment.
@@ -150,7 +201,7 @@ export CMAKE_CXX_FLAGS_RELEASE="${_BASE_CFLAGS}"
 export CMAKE_EXE_LINKER_FLAGS="${_BASE_LDFLAGS}"
 export CMAKE_SHARED_LINKER_FLAGS="${_BASE_LDFLAGS}"
 
-unset _BASE_CFLAGS _BASE_LDFLAGS _POLLY_FLAGS _AOCL_LDFLAGS _THEROCK_CLANG _AMD_OPT
+unset _BASE_CFLAGS _BASE_LDFLAGS _POLLY_FLAGS _AOCL_LDFLAGS _THEROCK_CLANG _AMD_OPT _VLLM_BUILD_JOBS
 
 # =============================================================================
 # ROCm / GPU Configuration (RDNA 3.5, gfx1151)
@@ -173,9 +224,27 @@ export HIP_CLANG_FLAGS="--offload-arch=gfx1151 -mllvm -amdgpu-early-inline-all=t
 # build-vllm.sh writes the git version tag to .rocm-version for reference.
 _ROCM_VERSION_FILE="${VLLM_DIR}/.rocm-version"
 
-if [[ -d "${_LOCAL_PREFIX}/lib" ]]; then
-    # Source-compiled TheRock (preferred — unified prefix)
+_LOCAL_ROCM_READY=0
+if [[ -x "${_LOCAL_PREFIX}/bin/hipcc" && -x "${_LOCAL_PREFIX}/lib/llvm/bin/amdclang" ]]; then
+    _LOCAL_ROCM_READY=1
+fi
+
+if [[ "${_VLLM_ROCM_PREFIX_MODE}" == "therock-build" ]]; then
+    if [[ -d "${_THEROCK_DIST_PREFIX}/lib" ]]; then
+        # Active TheRock build/resume: use the staged source-built ROCm tree.
+        export ROCM_PATH="${_THEROCK_DIST_PREFIX}"
+    else
+        # During early rebuild, avoid accidentally using a stale final install.
+        unset ROCM_PATH ROCM_VERSION
+    fi
+elif [[ "${_LOCAL_ROCM_READY}" == 1 ]]; then
+    # Source-compiled TheRock after install to the unified prefix.
     export ROCM_PATH="${_LOCAL_PREFIX}"
+elif [[ -d "${_THEROCK_DIST_PREFIX}/lib" ]]; then
+    # Mid-build TheRock dist prefix. This exists before the final unified
+    # install prefix is populated, and carries the source-built LLVM/OpenMP
+    # runtime needed by long resume builds.
+    export ROCM_PATH="${_THEROCK_DIST_PREFIX}"
 elif [[ -f "${_ROCM_VERSION_FILE}" ]]; then
     # Legacy: tarball-extracted ROCm
     ROCM_VERSION="$(cat "${_ROCM_VERSION_FILE}")"
@@ -186,6 +255,8 @@ fi
 if [[ -n "${ROCM_PATH:-}" && -d "${ROCM_PATH}" ]]; then
     export LD_LIBRARY_PATH="${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     export PATH="${ROCM_PATH}/lib/llvm/bin:${ROCM_PATH}/bin:${PATH}"
+    export CMAKE_PREFIX_PATH="${ROCM_PATH}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+    _vllm_prune_colon_path CMAKE_PREFIX_PATH
     for _omp_candidate in \
         "${ROCM_PATH}/lib/llvm/lib/libomp.so" \
         "${ROCM_PATH}/lib/llvm/lib/libiomp5.so" \
@@ -208,7 +279,7 @@ if [[ -n "${ROCM_PATH:-}" && -d "${ROCM_PATH}" ]]; then
     fi
 fi
 
-unset _ROCM_VERSION_FILE
+unset _ROCM_VERSION_FILE _THEROCK_DIST_PREFIX _VLLM_ROCM_PREFIX_MODE _LOCAL_ROCM_READY
 
 # =============================================================================
 # AITER Configuration
@@ -403,7 +474,12 @@ unset _LLAMACPP_ROCM _LLAMACPP_VULKAN _STABLE_DIFFUSION_VULKAN
 if [[ -d "${VLLM_VENV}" ]]; then
     # shellcheck source=/dev/null
     source "${VLLM_VENV}/bin/activate"
+elif [[ "${VIRTUAL_ENV:-}" == "${VLLM_VENV}" ]]; then
+    _vllm_path_remove "${VLLM_VENV}/bin"
+    unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
 fi
+
+unset -f _vllm_prune_colon_path _vllm_path_remove
 
 # =============================================================================
 # Info Display (--info flag)
@@ -423,6 +499,9 @@ if [[ "${1:-}" == "--info" ]]; then
     echo "    CXX:              ${CXX}"
     echo "    CFLAGS:           ${CFLAGS}"
     echo "    LDFLAGS:          ${LDFLAGS}"
+    echo "    Build jobs:       ${VLLM_BUILD_JOBS:-<not set>}"
+    echo "    MAX_JOBS:         ${MAX_JOBS:-<not set>}"
+    echo "    CMake parallel:   ${CMAKE_BUILD_PARALLEL_LEVEL:-<not set>}"
     if command -v ccache &>/dev/null && [[ -z "${VLLM_NO_CCACHE:-}" ]]; then
         echo "    ccache:           active ($(ccache --version | head -1))"
         echo "    CCACHE_MAXSIZE:   ${CCACHE_MAXSIZE:-default}"
