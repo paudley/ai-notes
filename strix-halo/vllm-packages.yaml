@@ -1719,6 +1719,73 @@ packages:
       (batch sizing, hipBLASLt, THP). RPATH patched via patchelf so
       binaries find their shared libraries without LD_LIBRARY_PATH.
 
+  llamacpp_atomic:
+    repo: "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git"
+    branch: "feature/turboquant-kv-cache"
+    src_dir: "llama.cpp-atomic-turboquant"
+    shallow: true
+    method: cmake
+    phase: I
+    steps: [34]
+    depends_on: [therock]
+    compiler: amdclang
+    skip_marker: null
+    backends:
+      rocm:
+        install_dir: "${VLLM_VENV}/rocm-atomic/llama_server"
+        build_dir: "build-rocm"
+        cmake_flags:
+          GGML_HIP: "ON"
+          GGML_NATIVE: "ON"
+          GGML_OPENMP: "ON"
+          GGML_CCACHE: "ON"
+          AMDGPU_TARGETS: "gfx1151"
+          GGML_LTO: "ON"
+          CMAKE_INTERPROCEDURAL_OPTIMIZATION: "ON"
+          LLAMA_BUILD_WEBUI: "OFF"
+        hip_flags: "--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
+        env:
+          HSA_OVERRIDE_GFX_VERSION: "11.5.1"
+          ROCBLAS_USE_HIPBLASLT: "1"
+          THP: "always"
+          LLAMA_ARG_BATCH: "2048"
+          LLAMA_ARG_UBATCH: "2048"
+      vulkan:
+        install_dir: "${VLLM_VENV}/vulkan-atomic/llama_server"
+        build_dir: "build-vulkan"
+        cmake_flags:
+          GGML_VULKAN: "ON"
+          GGML_NATIVE: "ON"
+          GGML_OPENMP: "ON"
+          GGML_CCACHE: "ON"
+          GGML_LTO: "ON"
+          CMAKE_INTERPROCEDURAL_OPTIMIZATION: "ON"
+          GGML_VULKAN_CHECK_RESULTS: "OFF"
+          GGML_VULKAN_VALIDATE: "OFF"
+          GGML_VULKAN_DEBUG: "OFF"
+          LLAMA_BUILD_WEBUI: "OFF"
+        env:
+          LLAMA_ARG_BATCH: "2048"
+          LLAMA_ARG_UBATCH: "2048"
+    binaries:
+      - llama-server
+      - llama-bench
+      - llama-cli
+      - llama-quantize
+    notes: |
+      AtomicBot-ai/atomic-llama-cpp-turboquant is built as an evaluation-only
+      side variant. It does not replace the default ggml-org/llama.cpp
+      Lemonade paths.
+
+      Install directories:
+        ROCm:   ${VLLM_VENV}/rocm-atomic/llama_server
+        Vulkan: ${VLLM_VENV}/vulkan-atomic/llama_server
+
+      The tracked branch is feature/turboquant-kv-cache, which is the current
+      repository HEAD and carries the Atomic TurboQuant / MTP evaluation work.
+      Keep experiments explicit by invoking binaries from these directories or
+      by using the LEMONADE_LLAMACPP_ATOMIC_*_DIR environment variables.
+
   lemonade:
     repo: "https://github.com/lemonade-sdk/lemonade.git"
     branch: "v10.0.0"

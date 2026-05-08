@@ -70,7 +70,7 @@
 #    33. Export source wheels    (torch, triton, torchvision, amd-aiter, amdsmi)
 #
 #   Phase I: Lemonade Inference Server (llama.cpp + FLM + ONNX)
-#    34. Clone Lemonade + build llama.cpp with hipBLAS for gfx1151
+#    34. Clone Lemonade + build upstream and Atomic llama.cpp variants
 #    35. Clone/build stable-diffusion.cpp with Vulkan for gfx1151
 #    36. Install Lemonade SDK from PyPI (lemonade-sdk)
 #    37. Validate Lemonade + stable-diffusion.cpp
@@ -317,11 +317,14 @@ TORCHVISION_SRC="${VLLM_DIR}/$(pkg torchvision src_dir)"
 FLASH_ATTN_SRC="${VLLM_DIR}/$(pkg flash_attention src_dir)"
 LEMONADE_SRC="${VLLM_DIR}/$(pkg lemonade src_dir)"
 LLAMACPP_SRC="${VLLM_DIR}/$(pkg llamacpp src_dir)"
+LLAMACPP_ATOMIC_SRC="${VLLM_DIR}/$(pkg llamacpp_atomic src_dir)"
 STABLE_DIFFUSION_SRC="${VLLM_DIR}/$(pkg stable_diffusion_cpp src_dir)"
 
 # Lemonade backend install directories
 LLAMACPP_ROCM_DIR="${VLLM_VENV}/rocm/llama_server"
 LLAMACPP_VULKAN_DIR="${VLLM_VENV}/vulkan/llama_server"
+LLAMACPP_ATOMIC_ROCM_DIR="${VLLM_VENV}/rocm-atomic/llama_server"
+LLAMACPP_ATOMIC_VULKAN_DIR="${VLLM_VENV}/vulkan-atomic/llama_server"
 LLAMACPP_INSTALL_DIR="${LLAMACPP_ROCM_DIR}"
 STABLE_DIFFUSION_VULKAN_DIR="${VLLM_VENV}/vulkan/stable_diffusion"
 
@@ -891,7 +894,7 @@ clone_pkg() {
         is_shallow="false"
     fi
 
-    if [[ -d "${src_dir}/.git" ]]; then
+    if [[ -e "${src_dir}/.git" ]]; then
         info "${description} already cloned at ${src_dir}"
         cd "${src_dir}"
 
@@ -5599,39 +5602,107 @@ export_source_wheels() {
 # Lemonade SDK (lemonade-sdk) from PyPI. The resulting binaries are placed where the SDK
 # expects them, with a .env file injecting gfx1151 runtime optimizations.
 
-clone_and_build_lemonade() {
-    log_step 34 "Clone Lemonade + build llama.cpp with hipBLAS for gfx1151"
-    configure_native_build_launchers
-    validate_toolchain_contract
+llamacpp_cpu_flags() {
+    echo "-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+}
 
-    # Clone both repos using generic clone_pkg (reads flags from YAML)
-    clone_pkg lemonade "${LEMONADE_SRC}" "Lemonade SDK"
-    clone_pkg llamacpp "${LLAMACPP_SRC}" "llama.cpp"
+llamacpp_link_flags() {
+    echo "-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
+}
 
-    local _build_dir="${LLAMACPP_SRC}/build-lemonade"
+llamacpp_install_matches_source() {
+    local _src_dir="$1"
+    local _install_dir="$2"
+    local _current_commit _installed_commit
 
-    # Skip if llama-server already built
-    if [[ -x "${_build_dir}/bin/llama-server" ]]; then
-        info "llama.cpp already built at ${_build_dir}/bin/llama-server"
+    [[ -f "${_install_dir}/build-info.env" ]] || return 1
+    _current_commit="$(git -C "${_src_dir}" rev-parse HEAD 2>/dev/null || true)"
+    _installed_commit="$(grep -E '^git_commit=' "${_install_dir}/build-info.env" 2>/dev/null | sed 's/^git_commit=//')"
+    [[ -n "${_current_commit}" && "${_current_commit}" == "${_installed_commit}" ]]
+}
+
+install_llamacpp_artifacts() {
+    local _src_dir="$1"
+    local _build_dir="$2"
+    local _install_dir="$3"
+    local _backend="$4"
+    local _env_yaml="$5"
+    local _label="$6"
+
+    mkdir -p "${_install_dir}"
+    local _binaries=(llama-server llama-bench llama-cli llama-quantize)
+    for _bin in "${_binaries[@]}"; do
+        if [[ -x "${_build_dir}/bin/${_bin}" ]]; then
+            cp -f "${_build_dir}/bin/${_bin}" "${_install_dir}/${_bin}"
+            info "Installed ${_bin} (${_label}) -> ${_install_dir}/${_bin}"
+        else
+            warn "${_bin} (${_label}) not found in build output"
+        fi
+    done
+
+    # Copy shared libraries (libggml-hip/vulkan, libllama, libmtmd) needed at runtime.
+    # Ninja/cmake may place .so files in bin/, lib/, src/, or ggml/src/ depending
+    # on the build configuration. Search all known locations.
+    local _lib_count=0
+    for _lib in "${_build_dir}"/bin/*.so* "${_build_dir}"/lib/*.so* "${_build_dir}"/src/*.so* "${_build_dir}"/ggml/src/*.so*; do
+        [[ -f "${_lib}" ]] || continue
+        cp -f "${_lib}" "${_install_dir}/"
+        _lib_count=$(( _lib_count + 1 ))
+    done
+    info "Copied ${_lib_count} shared libraries to ${_install_dir}/"
+
+    # Fix RPATH: cmake bakes build tree paths into RUNPATH. Rewrite to install dir
+    # so binaries find backend ggml libraries without LD_LIBRARY_PATH.
+    if command -v patchelf >/dev/null 2>&1; then
+        for _bin in "${_binaries[@]}"; do
+            [[ -x "${_install_dir}/${_bin}" ]] || continue
+            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${_install_dir}" "${_install_dir}/${_bin}"
+        done
+        info "RPATH fixed for ${_label} binaries -> ${LOCAL_PREFIX}/lib:${_install_dir}"
+    fi
+
+    # Copy convert_hf_to_gguf.py for GGUF conversion pipeline
+    if [[ -f "${_src_dir}/convert_hf_to_gguf.py" ]]; then
+        cp -f "${_src_dir}/convert_hf_to_gguf.py" "${_install_dir}/convert_hf_to_gguf.py"
+        info "Installed convert_hf_to_gguf.py (${_label})"
+    fi
+
+    local _llama_version
+    _llama_version="$(cd "${_src_dir}" && git describe --tags --always --dirty 2>/dev/null || echo "master")"
+    echo "${_llama_version}" > "${_install_dir}/version.txt"
+    echo "${_backend}" > "${_install_dir}/backend.txt"
+    write_build_manifest "${_install_dir}/build-info.env" "llama.cpp" "${_src_dir}" "${_build_dir}" "${_backend}"
+    info "Version tracking: ${_llama_version} (${_label})"
+
+    generate_env_file "${_env_yaml}" \
+        "${_install_dir}/.env" \
+        "gfx1151 runtime optimizations for ${_label}"
+}
+
+build_llamacpp_rocm_variant() {
+    local _src_dir="$1"
+    local _build_dir="$2"
+    local _install_dir="$3"
+    local _env_yaml="$4"
+    local _label="$5"
+
+    if [[ -x "${_build_dir}/bin/llama-server" ]] && llamacpp_install_matches_source "${_src_dir}" "${_install_dir}"; then
+        info "${_label} already built for current source at ${_build_dir}/bin/llama-server"
     else
-        info "Building llama.cpp with hipBLAS for gfx1151 (including llama-server)..."
+        info "Building ${_label} with hipBLAS for gfx1151..."
 
-        # Use amdclang from TheRock with full optimization flags
         local _cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
         local _cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
-
         if [[ ! -x "${_cc}" ]]; then
-            die "TheRock amdclang not found at ${_cc}; refusing to build llama.cpp ROCm with non-optimized system clang"
+            die "TheRock amdclang not found at ${_cc}; refusing to build ${_label} with non-optimized system clang"
         fi
 
-        # CPU optimization flags (Zen 5 + Polly + AMD-specific)
-        local _cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
+        local _cpu_flags _hip_flags _link_flags
+        _cpu_flags="$(llamacpp_cpu_flags)"
+        _hip_flags="--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
+        _link_flags="$(llamacpp_link_flags)"
 
-        # GPU optimization flags (RDNA 3.5 gfx1151)
-        local _hip_flags="--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
-        local _link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
-
-        cmake -B "${_build_dir}" -S "${LLAMACPP_SRC}" \
+        cmake -B "${_build_dir}" -S "${_src_dir}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HIP=ON \
@@ -5655,101 +5726,44 @@ clone_and_build_lemonade() {
             -DCMAKE_HIP_FLAGS_RELEASE="${_hip_flags}" \
             -DCMAKE_EXE_LINKER_FLAGS="${_link_flags}" \
             -DCMAKE_SHARED_LINKER_FLAGS="${_link_flags}" \
-            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${LLAMACPP_INSTALL_DIR}" \
+            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${_install_dir}" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_WEBUI=OFF \
-            -DCMAKE_INSTALL_PREFIX="${LLAMACPP_INSTALL_DIR}"
+            -DCMAKE_INSTALL_PREFIX="${_install_dir}"
 
         cmake --build "${_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
-        success "llama.cpp build complete"
+        success "${_label} build complete"
     fi
 
-    # --- Install binaries where Lemonade SDK expects them ---
-    mkdir -p "${LLAMACPP_INSTALL_DIR}"
+    install_llamacpp_artifacts "${_src_dir}" "${_build_dir}" "${_install_dir}" "rocm" "${_env_yaml}" "${_label}"
+    success "${_label} installed at ${_install_dir}"
+}
 
-    local _binaries=(llama-server llama-bench llama-cli llama-quantize)
-    for _bin in "${_binaries[@]}"; do
-        if [[ -x "${_build_dir}/bin/${_bin}" ]]; then
-            cp -f "${_build_dir}/bin/${_bin}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
-            info "Installed ${_bin} -> ${LLAMACPP_INSTALL_DIR}/${_bin}"
-        else
-            warn "${_bin} not found in build output"
-        fi
-    done
+build_llamacpp_vulkan_variant() {
+    local _src_dir="$1"
+    local _build_dir="$2"
+    local _install_dir="$3"
+    local _env_yaml="$4"
+    local _label="$5"
 
-    # Copy shared libraries (libggml-hip, libllama, libmtmd) needed at runtime.
-    # Ninja/cmake may place .so files in bin/, lib/, src/, or ggml/src/ depending
-    # on the build configuration. Search all known locations.
-    local _lib_count=0
-    for _lib in "${_build_dir}"/bin/*.so* "${_build_dir}"/lib/*.so* "${_build_dir}"/src/*.so* "${_build_dir}"/ggml/src/*.so*; do
-        [[ -f "${_lib}" ]] || continue
-        cp -f "${_lib}" "${LLAMACPP_INSTALL_DIR}/"
-        _lib_count=$(( _lib_count + 1 ))
-    done
-    info "Copied ${_lib_count} shared libraries to ${LLAMACPP_INSTALL_DIR}/"
-
-    # Fix RPATH: cmake bakes build tree paths into RUNPATH. Rewrite to install dir
-    # so binaries find libggml-hip.so/libllama.so without LD_LIBRARY_PATH.
-    if command -v patchelf >/dev/null 2>&1; then
-        for _bin in "${_binaries[@]}"; do
-            [[ -x "${LLAMACPP_INSTALL_DIR}/${_bin}" ]] || continue
-            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${LLAMACPP_INSTALL_DIR}" "${LLAMACPP_INSTALL_DIR}/${_bin}"
-        done
-        info "RPATH fixed for ROCm binaries -> ${LOCAL_PREFIX}/lib:${LLAMACPP_INSTALL_DIR}"
-    fi
-
-    # Copy convert_hf_to_gguf.py for GGUF conversion pipeline
-    if [[ -f "${LLAMACPP_SRC}/convert_hf_to_gguf.py" ]]; then
-        cp -f "${LLAMACPP_SRC}/convert_hf_to_gguf.py" "${LLAMACPP_INSTALL_DIR}/convert_hf_to_gguf.py"
-        info "Installed convert_hf_to_gguf.py"
-    fi
-
-    # --- Write version/backend tracking files so Lemonade SDK doesn't re-download ---
-    local _llama_version
-    _llama_version="$(cd "${LLAMACPP_SRC}" && git describe --tags --always 2>/dev/null || echo "master")"
-    echo "${_llama_version}" > "${LLAMACPP_INSTALL_DIR}/version.txt"
-    echo "rocm" > "${LLAMACPP_INSTALL_DIR}/backend.txt"
-    write_build_manifest "${LLAMACPP_INSTALL_DIR}/build-info.env" "llama.cpp" "${LLAMACPP_SRC}" "${_build_dir}" "rocm"
-    info "Version tracking: ${_llama_version} (rocm backend)"
-
-    # --- Write .env with gfx1151 runtime optimizations ---
-    # Lemonade's server command builder loads .env from the exe directory
-    # (lemonade/tools/server/llamacpp.py line 239). llama.cpp reads LLAMA_ARG_*
-    # env vars via set_env() in common/arg.cpp.
-    # Q8 KV cache (LLAMA_ARG_CACHE_TYPE_K/V=q8_0) omitted — halves KV bandwidth
-    # on unified memory but causes context creation failures on some small models
-    # (qwen2.5 0.5B FP16). Enable per-model during benchmarks.
-    generate_env_file ".packages.llamacpp.backends.rocm.env" \
-        "${LLAMACPP_INSTALL_DIR}/.env" \
-        "gfx1151 runtime optimizations for llama.cpp via Lemonade"
-
-    success "llama.cpp ROCm built and installed for Lemonade (gfx1151, hipBLAS, amdclang)"
-
-    # --- Build Vulkan backend ---
-    # Community benchmarks show Vulkan wins generation speed (44 vs 39 tok/s) and
-    # prefill above ~32K context on gfx1151 (no VMM limitation). We build both
-    # backends so Lemonade/llama-swap can route based on workload.
-    local _vulkan_build_dir="${LLAMACPP_SRC}/build-vulkan"
-
-    if [[ -x "${_vulkan_build_dir}/bin/llama-server" ]]; then
-        info "llama.cpp Vulkan already built at ${_vulkan_build_dir}/bin/llama-server"
+    if [[ -x "${_build_dir}/bin/llama-server" ]] && llamacpp_install_matches_source "${_src_dir}" "${_install_dir}"; then
+        info "${_label} already built for current source at ${_build_dir}/bin/llama-server"
     else
-        info "Building llama.cpp with Vulkan backend..."
+        info "Building ${_label} with Vulkan backend..."
 
-        local _vulkan_cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
-        local _vulkan_cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
-
-        local _vulkan_cpu_flags
-        if [[ ! -x "${_vulkan_cc}" ]]; then
-            die "TheRock amdclang not found at ${_vulkan_cc}; refusing to build llama.cpp Vulkan with non-optimized system clang"
+        local _cc="${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+        local _cxx="${LOCAL_PREFIX}/lib/llvm/bin/amdclang++"
+        if [[ ! -x "${_cc}" ]]; then
+            die "TheRock amdclang not found at ${_cc}; refusing to build ${_label} with non-optimized system clang"
         fi
-        _vulkan_cpu_flags="-O3 -DNDEBUG -march=native -flto=thin -fno-semantic-interposition -mprefer-vector-width=512 -mavx512f -mavx512dq -mavx512vl -mavx512bw -famd-opt -mllvm -polly -mllvm -polly-vectorizer=stripmine -mllvm -inline-threshold=600 -mllvm -unroll-threshold=150 -mllvm -adce-remove-loops -Wno-error=unused-command-line-argument"
 
-        local _vulkan_link_flags="-flto=thin -fuse-ld=lld -Wl,-rpath,${LOCAL_PREFIX}/lib -L${LOCAL_PREFIX}/lib -lalm"
+        local _cpu_flags _link_flags
+        _cpu_flags="$(llamacpp_cpu_flags)"
+        _link_flags="$(llamacpp_link_flags)"
 
-        cmake -B "${_vulkan_build_dir}" -S "${LLAMACPP_SRC}" \
+        cmake -B "${_build_dir}" -S "${_src_dir}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_VULKAN=ON \
@@ -5761,69 +5775,68 @@ clone_and_build_lemonade() {
             -DGGML_VULKAN_CHECK_RESULTS=OFF \
             -DGGML_VULKAN_VALIDATE=OFF \
             -DGGML_VULKAN_DEBUG=OFF \
-            -DCMAKE_C_COMPILER="${_vulkan_cc}" \
-            -DCMAKE_CXX_COMPILER="${_vulkan_cxx}" \
+            -DCMAKE_C_COMPILER="${_cc}" \
+            -DCMAKE_CXX_COMPILER="${_cxx}" \
             -DCMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-}" \
             -DCMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-}" \
-            -DCMAKE_C_FLAGS="${_vulkan_cpu_flags}" \
-            -DCMAKE_CXX_FLAGS="${_vulkan_cpu_flags}" \
-            -DCMAKE_C_FLAGS_RELEASE="${_vulkan_cpu_flags}" \
-            -DCMAKE_CXX_FLAGS_RELEASE="${_vulkan_cpu_flags}" \
-            -DCMAKE_EXE_LINKER_FLAGS="${_vulkan_link_flags}" \
-            -DCMAKE_SHARED_LINKER_FLAGS="${_vulkan_link_flags}" \
-            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${LLAMACPP_VULKAN_DIR}" \
+            -DCMAKE_C_FLAGS="${_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS="${_cpu_flags}" \
+            -DCMAKE_C_FLAGS_RELEASE="${_cpu_flags}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${_cpu_flags}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${_link_flags}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${_link_flags}" \
+            -DCMAKE_INSTALL_RPATH="${LOCAL_PREFIX}/lib;${_install_dir}" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_WEBUI=OFF
 
-        cmake --build "${_vulkan_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
-        success "llama.cpp Vulkan build complete"
+        cmake --build "${_build_dir}" --config Release -j "${VLLM_BUILD_JOBS:-$(nproc)}"
+        success "${_label} build complete"
     fi
 
-    # --- Install Vulkan binaries ---
-    mkdir -p "${LLAMACPP_VULKAN_DIR}"
+    install_llamacpp_artifacts "${_src_dir}" "${_build_dir}" "${_install_dir}" "vulkan" "${_env_yaml}" "${_label}"
+    success "${_label} installed at ${_install_dir}"
+}
 
-    for _bin in "${_binaries[@]}"; do
-        if [[ -x "${_vulkan_build_dir}/bin/${_bin}" ]]; then
-            cp -f "${_vulkan_build_dir}/bin/${_bin}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
-            info "Installed ${_bin} (vulkan) -> ${LLAMACPP_VULKAN_DIR}/${_bin}"
-        else
-            warn "${_bin} (vulkan) not found in build output"
-        fi
-    done
+clone_and_build_lemonade() {
+    log_step 34 "Clone Lemonade + build upstream and Atomic llama.cpp variants for gfx1151"
+    configure_native_build_launchers
+    validate_toolchain_contract
 
-    # Copy Vulkan shared libraries (same search pattern as ROCm)
-    local _vlib_count=0
-    for _lib in "${_vulkan_build_dir}"/bin/*.so* "${_vulkan_build_dir}"/lib/*.so* "${_vulkan_build_dir}"/src/*.so* "${_vulkan_build_dir}"/ggml/src/*.so*; do
-        [[ -f "${_lib}" ]] || continue
-        cp -f "${_lib}" "${LLAMACPP_VULKAN_DIR}/"
-        _vlib_count=$(( _vlib_count + 1 ))
-    done
-    info "Copied ${_vlib_count} shared libraries to ${LLAMACPP_VULKAN_DIR}/"
+    clone_pkg lemonade "${LEMONADE_SRC}" "Lemonade SDK"
+    clone_pkg llamacpp "${LLAMACPP_SRC}" "llama.cpp"
+    clone_pkg llamacpp_atomic "${LLAMACPP_ATOMIC_SRC}" "Atomic llama.cpp TurboQuant"
 
-    # Fix RPATH for Vulkan binaries
-    if command -v patchelf >/dev/null 2>&1; then
-        for _bin in "${_binaries[@]}"; do
-            [[ -x "${LLAMACPP_VULKAN_DIR}/${_bin}" ]] || continue
-            patchelf --set-rpath "${LOCAL_PREFIX}/lib:${LLAMACPP_VULKAN_DIR}" "${LLAMACPP_VULKAN_DIR}/${_bin}"
-        done
-        info "RPATH fixed for Vulkan binaries -> ${LOCAL_PREFIX}/lib:${LLAMACPP_VULKAN_DIR}"
-    fi
+    build_llamacpp_rocm_variant \
+        "${LLAMACPP_SRC}" \
+        "${LLAMACPP_SRC}/build-lemonade" \
+        "${LLAMACPP_INSTALL_DIR}" \
+        ".packages.llamacpp.backends.rocm.env" \
+        "llama.cpp upstream ROCm"
 
-    # Version tracking for Vulkan backend
-    echo "${_llama_version}" > "${LLAMACPP_VULKAN_DIR}/version.txt"
-    echo "vulkan" > "${LLAMACPP_VULKAN_DIR}/backend.txt"
-    write_build_manifest "${LLAMACPP_VULKAN_DIR}/build-info.env" "llama.cpp" "${LLAMACPP_SRC}" "${_vulkan_build_dir}" "vulkan"
+    build_llamacpp_vulkan_variant \
+        "${LLAMACPP_SRC}" \
+        "${LLAMACPP_SRC}/build-vulkan" \
+        "${LLAMACPP_VULKAN_DIR}" \
+        ".packages.llamacpp.backends.vulkan.env" \
+        "llama.cpp upstream Vulkan"
 
-    # Vulkan .env — no HSA/ROCm vars needed, just batch/KV optimizations
-    # Q8 KV cache omitted (see ROCm .env comment above)
-    generate_env_file ".packages.llamacpp.backends.vulkan.env" \
-        "${LLAMACPP_VULKAN_DIR}/.env" \
-        "gfx1151 runtime optimizations for llama.cpp Vulkan backend"
+    build_llamacpp_rocm_variant \
+        "${LLAMACPP_ATOMIC_SRC}" \
+        "${LLAMACPP_ATOMIC_SRC}/build-rocm" \
+        "${LLAMACPP_ATOMIC_ROCM_DIR}" \
+        ".packages.llamacpp_atomic.backends.rocm.env" \
+        "Atomic llama.cpp TurboQuant ROCm"
 
-    success "llama.cpp Vulkan built and installed at ${LLAMACPP_VULKAN_DIR}"
-    success "Both ROCm and Vulkan backends ready for Lemonade"
+    build_llamacpp_vulkan_variant \
+        "${LLAMACPP_ATOMIC_SRC}" \
+        "${LLAMACPP_ATOMIC_SRC}/build-vulkan" \
+        "${LLAMACPP_ATOMIC_VULKAN_DIR}" \
+        ".packages.llamacpp_atomic.backends.vulkan.env" \
+        "Atomic llama.cpp TurboQuant Vulkan"
+
+    success "llama.cpp upstream and Atomic TurboQuant variants are ready"
 }
 
 clone_and_build_stable_diffusion() {
@@ -6066,6 +6079,25 @@ assert importlib.util.find_spec('lemonade') or importlib.util.find_spec('lemonad
     else
         warn "Vulkan llama-server not found at ${LLAMACPP_VULKAN_DIR}/llama-server"
         warn "Only ROCm backend available — Vulkan will not be usable for >32K context"
+    fi
+
+    # --- Validate Atomic TurboQuant side builds ---
+    info "Checking Atomic TurboQuant side builds..."
+    if [[ -x "${LLAMACPP_ATOMIC_ROCM_DIR}/llama-server" ]]; then
+        success "llama-server (atomic rocm): ${LLAMACPP_ATOMIC_ROCM_DIR}/llama-server"
+        if [[ -f "${LLAMACPP_ATOMIC_ROCM_DIR}/version.txt" ]]; then
+            info "Atomic ROCm version: $(cat "${LLAMACPP_ATOMIC_ROCM_DIR}/version.txt")"
+        fi
+    else
+        warn "Atomic ROCm llama-server not found at ${LLAMACPP_ATOMIC_ROCM_DIR}/llama-server"
+    fi
+    if [[ -x "${LLAMACPP_ATOMIC_VULKAN_DIR}/llama-server" ]]; then
+        success "llama-server (atomic vulkan): ${LLAMACPP_ATOMIC_VULKAN_DIR}/llama-server"
+        if [[ -f "${LLAMACPP_ATOMIC_VULKAN_DIR}/version.txt" ]]; then
+            info "Atomic Vulkan version: $(cat "${LLAMACPP_ATOMIC_VULKAN_DIR}/version.txt")"
+        fi
+    else
+        warn "Atomic Vulkan llama-server not found at ${LLAMACPP_ATOMIC_VULKAN_DIR}/llama-server"
     fi
 
     # --- Validate stable-diffusion.cpp Vulkan backend ---

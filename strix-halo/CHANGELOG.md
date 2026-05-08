@@ -51,9 +51,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Optimized wheel installation** (steps 30-31): Source-built wheels are now
   installed back into the build venv, replacing pip-resolved versions with
   Zen 5-optimized native builds.
-- **Lemonade + llama.cpp** (steps 33-35): Dual-backend llama.cpp build (ROCm
-  hipBLAS + Vulkan) managed by Lemonade SDK, with generated `.env` files for
-  each backend.
+- **Lemonade + llama.cpp** (steps 33-35): Dual-backend upstream llama.cpp build
+  (ROCm hipBLAS + Vulkan) managed by Lemonade SDK, plus non-default Atomic
+  TurboQuant ROCm/Vulkan side builds for MTP evaluation. Each backend gets a
+  generated `.env` file.
 - **`meson`** added to OS prerequisites (required by TheRock's
   `THEROCK_BUNDLE_SYSDEPS=ON` default).
 - **`common.sh`**: Standalone shared shell helpers (logging, section headers,

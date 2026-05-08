@@ -458,6 +458,20 @@ if [[ -d "${_LLAMACPP_VULKAN}" ]]; then
     export LD_LIBRARY_PATH="${_LLAMACPP_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
+# Atomic TurboQuant evaluation backends. These are intentionally not added to
+# PATH and do not replace Lemonade's default upstream llama.cpp binaries.
+_LLAMACPP_ATOMIC_ROCM="${VLLM_VENV}/rocm-atomic/llama_server"
+if [[ -d "${_LLAMACPP_ATOMIC_ROCM}" ]]; then
+    export LEMONADE_LLAMACPP_ATOMIC_ROCM_DIR="${_LLAMACPP_ATOMIC_ROCM}"
+    export LD_LIBRARY_PATH="${_LLAMACPP_ATOMIC_ROCM}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+_LLAMACPP_ATOMIC_VULKAN="${VLLM_VENV}/vulkan-atomic/llama_server"
+if [[ -d "${_LLAMACPP_ATOMIC_VULKAN}" ]]; then
+    export LEMONADE_LLAMACPP_ATOMIC_VULKAN_DIR="${_LLAMACPP_ATOMIC_VULKAN}"
+    export LD_LIBRARY_PATH="${_LLAMACPP_ATOMIC_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 # stable-diffusion.cpp Vulkan backend (image generation)
 _STABLE_DIFFUSION_VULKAN="${VLLM_VENV}/vulkan/stable_diffusion"
 if [[ -d "${_STABLE_DIFFUSION_VULKAN}" ]]; then
@@ -465,7 +479,7 @@ if [[ -d "${_STABLE_DIFFUSION_VULKAN}" ]]; then
     export PATH="${_STABLE_DIFFUSION_VULKAN}:${PATH}"
     export LD_LIBRARY_PATH="${_STABLE_DIFFUSION_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
-unset _LLAMACPP_ROCM _LLAMACPP_VULKAN _STABLE_DIFFUSION_VULKAN
+unset _LLAMACPP_ROCM _LLAMACPP_VULKAN _LLAMACPP_ATOMIC_ROCM _LLAMACPP_ATOMIC_VULKAN _STABLE_DIFFUSION_VULKAN
 
 # =============================================================================
 # Virtual Environment Activation
@@ -549,6 +563,8 @@ if [[ "${1:-}" == "--info" ]]; then
     echo "  Lemonade / llama.cpp:"
     echo "    ROCm backend:     ${LEMONADE_LLAMACPP_DIR:-<not built>}"
     echo "    Vulkan backend:   ${LEMONADE_LLAMACPP_VULKAN_DIR:-<not built>}"
+    echo "    Atomic ROCm:      ${LEMONADE_LLAMACPP_ATOMIC_ROCM_DIR:-<not built>}"
+    echo "    Atomic Vulkan:    ${LEMONADE_LLAMACPP_ATOMIC_VULKAN_DIR:-<not built>}"
     echo "    llama-server:     $(command -v llama-server 2>/dev/null || echo 'not in PATH')"
     echo "    llama-bench:      $(command -v llama-bench 2>/dev/null || echo 'not in PATH')"
     echo "    llama-quantize:   $(command -v llama-quantize 2>/dev/null || echo 'not in PATH')"
