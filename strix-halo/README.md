@@ -117,7 +117,7 @@ Phase H: Optimized Wheels (Zen 5 native builds for downstream venvs)
  33. Export source wheels   (torch, triton, torchvision, amd-aiter, amdsmi)
 
 Phase I: Lemonade Inference Server
-  34. Clone Lemonade + build llama.cpp (ROCm hipBLAS + Vulkan backends)
+  34. Clone Lemonade + build upstream and Atomic llama.cpp (ROCm + Vulkan)
   35. Clone/build stable-diffusion.cpp (Vulkan backend)
   36. Install Lemonade SDK from PyPI
   37. Validate Lemonade + stable-diffusion.cpp
@@ -168,6 +168,14 @@ AOCL-LibM and keeps Vulkan validation/debug checks disabled for release use.
 Both backends are installed into the venv and Lemonade can route between
 them based on workload. Each backend gets its own `.env` file with
 gfx1151 runtime optimizations (batch sizing, hipBLASLt, THP).
+
+Phase I also builds
+[AtomicBot-ai/atomic-llama-cpp-turboquant](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant)
+from `feature/turboquant-kv-cache` as an evaluation-only side variant for
+TurboQuant/MTP work. It is installed separately under
+`${VLLM_VENV}/rocm-atomic/llama_server` and
+`${VLLM_VENV}/vulkan-atomic/llama_server`; the default Lemonade paths and
+`PATH` continue to point at upstream `ggml-org/llama.cpp`.
 
 ### stable-diffusion.cpp: Vulkan Image Generation
 
@@ -313,6 +321,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 | AOCL-LibM | amd/aocl-libm-ose | main |
 | AOCL-Utils | amd/aocl-utils | main |
 | llama.cpp | ggml-org/llama.cpp | master |
+| Atomic llama.cpp TurboQuant | AtomicBot-ai/atomic-llama-cpp-turboquant | feature/turboquant-kv-cache |
 | stable-diffusion.cpp | leejet/stable-diffusion.cpp | master |
 | Lemonade | lemonade-sdk/lemonade | v10.0.0 |
 
