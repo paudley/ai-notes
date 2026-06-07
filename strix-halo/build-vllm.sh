@@ -5630,6 +5630,10 @@ install_llamacpp_artifacts() {
     local _label="$6"
 
     mkdir -p "${_install_dir}"
+    find "${_install_dir}" -maxdepth 1 -type f \
+        \( -name 'libggml*.so*' -o -name 'libllama*.so*' -o -name 'libmtmd*.so*' \) \
+        -delete
+
     local _binaries=(llama-server llama-bench llama-cli llama-quantize)
     for _bin in "${_binaries[@]}"; do
         if [[ -x "${_build_dir}/bin/${_bin}" ]]; then

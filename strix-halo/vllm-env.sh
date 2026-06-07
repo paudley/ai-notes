@@ -75,6 +75,26 @@ _vllm_path_remove() {
     export PATH="${_new_path}"
 }
 
+_vllm_colon_path_remove() {
+    local _var_name="$1"
+    local _remove="$2"
+    local _value="${!_var_name:-}"
+    local _entry _new_value=""
+    [[ -n "${_value}" ]] || return 0
+
+    local IFS=:
+    for _entry in ${_value}; do
+        [[ "${_entry}" == "${_remove}" ]] && continue
+        _new_value="${_new_value:+${_new_value}:}${_entry}"
+    done
+
+    if [[ -n "${_new_value}" ]]; then
+        export "${_var_name}=${_new_value}"
+    else
+        unset "${_var_name}"
+    fi
+}
+
 _vllm_prune_colon_path LD_PRELOAD
 
 # =============================================================================
@@ -445,31 +465,37 @@ export AOTRITON_INSTALL_DIR="${_LOCAL_PREFIX}"
 
 # ROCm backend (primary — hipBLAS, best prefill <32K context)
 _LLAMACPP_ROCM="${VLLM_VENV}/rocm/llama_server"
+_LLAMACPP_VULKAN="${VLLM_VENV}/vulkan/llama_server"
+_LLAMACPP_ATOMIC_ROCM="${VLLM_VENV}/rocm-atomic/llama_server"
+_LLAMACPP_ATOMIC_VULKAN="${VLLM_VENV}/vulkan-atomic/llama_server"
+
+for _llamacpp_dir in "${_LLAMACPP_ROCM}" "${_LLAMACPP_VULKAN}" "${_LLAMACPP_ATOMIC_ROCM}" "${_LLAMACPP_ATOMIC_VULKAN}"; do
+    _vllm_path_remove "${_llamacpp_dir}"
+    _vllm_colon_path_remove LD_LIBRARY_PATH "${_llamacpp_dir}"
+done
+unset _llamacpp_dir
+
 if [[ -d "${_LLAMACPP_ROCM}" ]]; then
     export LEMONADE_LLAMACPP_DIR="${_LLAMACPP_ROCM}"
     export PATH="${_LLAMACPP_ROCM}:${PATH}"
-    export LD_LIBRARY_PATH="${_LLAMACPP_ROCM}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 # Vulkan backend (best generation speed + prefill >32K context on gfx1151)
-_LLAMACPP_VULKAN="${VLLM_VENV}/vulkan/llama_server"
 if [[ -d "${_LLAMACPP_VULKAN}" ]]; then
     export LEMONADE_LLAMACPP_VULKAN_DIR="${_LLAMACPP_VULKAN}"
-    export LD_LIBRARY_PATH="${_LLAMACPP_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-# Atomic TurboQuant evaluation backends. These are intentionally not added to
-# PATH and do not replace Lemonade's default upstream llama.cpp binaries.
-_LLAMACPP_ATOMIC_ROCM="${VLLM_VENV}/rocm-atomic/llama_server"
+# llama.cpp binaries use RUNPATH, so none of the llama.cpp install dirs are
+# added to LD_LIBRARY_PATH. This keeps ROCm, Vulkan, and Atomic libraries from
+# being mixed by the dynamic loader.
+
+# Atomic TurboQuant evaluation backends. These are intentionally not added to PATH.
 if [[ -d "${_LLAMACPP_ATOMIC_ROCM}" ]]; then
     export LEMONADE_LLAMACPP_ATOMIC_ROCM_DIR="${_LLAMACPP_ATOMIC_ROCM}"
-    export LD_LIBRARY_PATH="${_LLAMACPP_ATOMIC_ROCM}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-_LLAMACPP_ATOMIC_VULKAN="${VLLM_VENV}/vulkan-atomic/llama_server"
 if [[ -d "${_LLAMACPP_ATOMIC_VULKAN}" ]]; then
     export LEMONADE_LLAMACPP_ATOMIC_VULKAN_DIR="${_LLAMACPP_ATOMIC_VULKAN}"
-    export LD_LIBRARY_PATH="${_LLAMACPP_ATOMIC_VULKAN}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 # stable-diffusion.cpp Vulkan backend (image generation)
@@ -493,7 +519,7 @@ elif [[ "${VIRTUAL_ENV:-}" == "${VLLM_VENV}" ]]; then
     unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
 fi
 
-unset -f _vllm_prune_colon_path _vllm_path_remove
+unset -f _vllm_prune_colon_path _vllm_path_remove _vllm_colon_path_remove
 
 # =============================================================================
 # Info Display (--info flag)
